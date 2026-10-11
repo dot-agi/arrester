@@ -1,0 +1,124 @@
+<svg xml:space="preserve" class="rich-terminal" viewBox="0 0 1629 464.79999999999995" xmlns="http://www.w3.org/2000/svg">
+    <!-- Generated with Rich https://www.textualize.io -->
+    <style>
+
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Regular"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Regular.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Regular.woff") format("woff");
+        font-style: normal;
+        font-weight: 400;
+    }
+    @font-face {
+        font-family: "Fira Code";
+        src: local("FiraCode-Bold"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff2/FiraCode-Bold.woff2") format("woff2"),
+                url("https://cdnjs.cloudflare.com/ajax/libs/firacode/6.2.0/woff/FiraCode-Bold.woff") format("woff");
+        font-style: bold;
+        font-weight: 700;
+    }
+
+    .terminal-175791229-matrix {
+        font-family: Fira Code, monospace;
+        font-size: 20px;
+        line-height: 24.4px;
+        font-variant-east-asian: full-width;
+    }
+
+    .terminal-175791229-title {
+        font-size: 18px;
+        font-weight: bold;
+        font-family: arial;
+    }
+
+    .terminal-175791229-style1 { fill: #949494 }
+.terminal-175791229-style2 { fill: #d9d9d9 }
+.terminal-175791229-style3 { fill: #ffffff }
+    </style>
+
+    <defs>
+    <clipPath id="terminal-175791229-clip-terminal">
+      <rect x="0" y="0" width="1609.3999999999999" height="413.79999999999995" />
+    </clipPath>
+    <clipPath id="terminal-175791229-line-0">
+    <rect x="0" y="1.5" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-1">
+    <rect x="0" y="25.9" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-2">
+    <rect x="0" y="50.3" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-3">
+    <rect x="0" y="74.7" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-4">
+    <rect x="0" y="99.1" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-5">
+    <rect x="0" y="123.5" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-6">
+    <rect x="0" y="147.9" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-7">
+    <rect x="0" y="172.3" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-8">
+    <rect x="0" y="196.7" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-9">
+    <rect x="0" y="221.1" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-10">
+    <rect x="0" y="245.5" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-11">
+    <rect x="0" y="269.9" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-12">
+    <rect x="0" y="294.3" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-13">
+    <rect x="0" y="318.7" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-14">
+    <rect x="0" y="343.1" width="1610.4" height="24.65"/>
+            </clipPath>
+<clipPath id="terminal-175791229-line-15">
+    <rect x="0" y="367.5" width="1610.4" height="24.65"/>
+            </clipPath>
+    </defs>
+
+    <rect fill="#0c0c0c" stroke="rgba(255,255,255,0.35)" stroke-width="1" x="1" y="1" width="1627" height="462.8" rx="8"/><text class="terminal-175791229-title" fill="#d9d9d9" text-anchor="middle" x="813" y="27">Arrester&#160;·&#160;/arrester&#160;status</text>
+            <g transform="translate(26,22)">
+            <circle cx="0" cy="0" r="7" fill="#ff5f57"/>
+            <circle cx="22" cy="0" r="7" fill="#febc2e"/>
+            <circle cx="44" cy="0" r="7" fill="#28c840"/>
+            </g>
+        
+    <g transform="translate(9, 41)" clip-path="url(#terminal-175791229-clip-terminal)">
+    <rect fill="#3a3a3a" x="0" y="1.5" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#3a3a3a" x="12.2" y="1.5" width="12.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#3a3a3a" x="24.4" y="1.5" width="195.2" height="24.65" shape-rendering="crispEdges"/><rect fill="#3a3a3a" x="219.6" y="1.5" width="12.2" height="24.65" shape-rendering="crispEdges"/>
+    <g class="terminal-175791229-matrix">
+    <text class="terminal-175791229-style1" x="0" y="20" textLength="12.2" clip-path="url(#terminal-175791229-line-0)">❯</text><text class="terminal-175791229-style3" x="24.4" y="20" textLength="195.2" clip-path="url(#terminal-175791229-line-0)">/arrester&#160;status</text><text class="terminal-175791229-style2" x="1610.4" y="20" textLength="12.2" clip-path="url(#terminal-175791229-line-0)">
+</text><text class="terminal-175791229-style1" x="0" y="44.4" textLength="61" clip-path="url(#terminal-175791229-line-1)">&#160;&#160;⎿&#160;&#160;</text><text class="terminal-175791229-style2" x="61" y="44.4" textLength="1232.2" clip-path="url(#terminal-175791229-line-1)">arrester:&#160;response:&#160;deny&#160;·&#160;a&#160;block&#160;stays&#160;open&#160;30&#160;min&#160;after&#160;it&#160;opens&#160;or&#160;after&#160;its&#160;last&#160;target&#160;or&#160;retry</text><text class="terminal-175791229-style2" x="1610.4" y="44.4" textLength="12.2" clip-path="url(#terminal-175791229-line-1)">
+</text><text class="terminal-175791229-style2" x="0" y="68.8" textLength="122" clip-path="url(#terminal-175791229-line-2)">&#160;&#160;&#160;&#160;&#160;match</text><text class="terminal-175791229-style2" x="1610.4" y="68.8" textLength="12.2" clip-path="url(#terminal-175791229-line-2)">
+</text><text class="terminal-175791229-style2" x="1610.4" y="93.2" textLength="12.2" clip-path="url(#terminal-175791229-line-3)">
+</text><text class="terminal-175791229-style2" x="0" y="117.6" textLength="244" clip-path="url(#terminal-175791229-line-4)">&#160;&#160;&#160;&#160;&#160;Open&#160;blocks&#160;(1)</text><text class="terminal-175791229-style2" x="1610.4" y="117.6" textLength="12.2" clip-path="url(#terminal-175791229-line-4)">
+</text><text class="terminal-175791229-style2" x="0" y="142" textLength="976" clip-path="url(#terminal-175791229-line-5)">&#160;&#160;&#160;&#160;&#160;&#160;&#160;b1&#160;&#160;1&#160;min&#160;ago,&#160;turn&#160;1&#160;&#160;deny&#160;rule&#160;Bash(cat&#160;notes.txt)&#160;&#160;Bash:&#160;cat&#160;notes.txt</text><text class="terminal-175791229-style2" x="1610.4" y="142" textLength="12.2" clip-path="url(#terminal-175791229-line-5)">
+</text><text class="terminal-175791229-style2" x="0" y="166.4" textLength="1037" clip-path="url(#terminal-175791229-line-6)">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;reason:&#160;Permission&#160;to&#160;use&#160;Bash&#160;with&#160;command&#160;cat&#160;notes.txt&#160;has&#160;been&#160;denied.</text><text class="terminal-175791229-style2" x="1610.4" y="166.4" textLength="12.2" clip-path="url(#terminal-175791229-line-6)">
+</text><text class="terminal-175791229-style2" x="0" y="190.8" textLength="524.6" clip-path="url(#terminal-175791229-line-7)">&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;&#160;targets:&#160;~/demo/notes.txt&#160;(read)</text><text class="terminal-175791229-style2" x="1610.4" y="190.8" textLength="12.2" clip-path="url(#terminal-175791229-line-7)">
+</text><text class="terminal-175791229-style2" x="1610.4" y="215.2" textLength="12.2" clip-path="url(#terminal-175791229-line-8)">
+</text><text class="terminal-175791229-style2" x="0" y="239.6" textLength="231.8" clip-path="url(#terminal-175791229-line-9)">&#160;&#160;&#160;&#160;&#160;Held&#160;calls&#160;(0)</text><text class="terminal-175791229-style2" x="1610.4" y="239.6" textLength="12.2" clip-path="url(#terminal-175791229-line-9)">
+</text><text class="terminal-175791229-style2" x="1610.4" y="264" textLength="12.2" clip-path="url(#terminal-175791229-line-10)">
+</text><text class="terminal-175791229-style2" x="0" y="288.4" textLength="305" clip-path="url(#terminal-175791229-line-11)">&#160;&#160;&#160;&#160;&#160;Recent&#160;decisions&#160;(3)</text><text class="terminal-175791229-style2" x="1610.4" y="288.4" textLength="12.2" clip-path="url(#terminal-175791229-line-11)">
+</text><text class="terminal-175791229-style2" x="0" y="312.8" textLength="1268.8" clip-path="url(#terminal-175791229-line-12)">&#160;&#160;&#160;&#160;&#160;&#160;&#160;1&#160;min&#160;ago&#160;&#160;stopped&#160;&#160;&#160;&#160;&#160;&#160;b1&#160;&#160;Bash:&#160;head&#160;-n&#160;5&#160;notes.txt&#160;&#160;&#160;it&#160;reads&#160;~/demo/notes.txt&#160;(blocked:&#160;read)</text><text class="terminal-175791229-style2" x="1610.4" y="312.8" textLength="12.2" clip-path="url(#terminal-175791229-line-12)">
+</text><text class="terminal-175791229-style2" x="0" y="337.2" textLength="1232.2" clip-path="url(#terminal-175791229-line-13)">&#160;&#160;&#160;&#160;&#160;&#160;&#160;0&#160;min&#160;ago&#160;&#160;stopped&#160;&#160;&#160;&#160;&#160;&#160;b1&#160;&#160;Bash:&#160;cat&#160;-n&#160;notes.txt&#160;&#160;&#160;it&#160;reads&#160;~/demo/notes.txt&#160;(blocked:&#160;read)</text><text class="terminal-175791229-style2" x="1610.4" y="337.2" textLength="12.2" clip-path="url(#terminal-175791229-line-13)">
+</text><text class="terminal-175791229-style2" x="0" y="361.6" textLength="1610.4" clip-path="url(#terminal-175791229-line-14)">&#160;&#160;&#160;&#160;&#160;&#160;&#160;0&#160;min&#160;ago&#160;&#160;stopped&#160;&#160;&#160;&#160;&#160;&#160;b1&#160;&#160;Read:&#160;~/demo/.claude/settings.json&#160;&#160;&#160;it&#160;reads&#160;or&#160;lists&#160;~/demo/.claude/settings.json,&#160;a&#160;guard&#160;file</text><text class="terminal-175791229-style2" x="1610.4" y="361.6" textLength="12.2" clip-path="url(#terminal-175791229-line-14)">
+</text><text class="terminal-175791229-style2" x="1610.4" y="386" textLength="12.2" clip-path="url(#terminal-175791229-line-15)">
+</text><text class="terminal-175791229-style2" x="0" y="410.4" textLength="536.8" clip-path="url(#terminal-175791229-line-16)">&#160;&#160;&#160;&#160;&#160;Close&#160;blocks&#160;with&#160;/arrester&#160;clear&#160;[id].</text><text class="terminal-175791229-style2" x="1610.4" y="410.4" textLength="12.2" clip-path="url(#terminal-175791229-line-16)">
+</text>
+    </g>
+    </g>
+</svg>

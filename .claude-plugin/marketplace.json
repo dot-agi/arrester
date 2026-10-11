@@ -1,0 +1,14 @@
+{
+  "name": "arrester",
+  "owner": { "name": "dot-agi" },
+  "metadata": { "description": "Arrester: catch an agent that works around a blocked tool call" },
+  "plugins": [
+    {
+      "name": "arrester",
+      "source": "./",
+      "description": "After a hook, deny rule, or auto mode blocks a tool call, Arrester stops later calls that reach the same result another way or read or change your guards. After your No, it stops only exact retries.",
+      "category": "security",
+      "tags": ["mod", "security", "guardrails", "hooks", "claude-code"]
+    }
+  ]
+}
