@@ -1,0 +1,168 @@
+# CI for a Claude Code mod repository. The same file runs in each mod repository.
+# Jobs: validate the manifests with two Claude Code versions, check the version rule,
+# and dry-run the release tag. The job "ci" passes only when every other job passes.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: validate (Claude Code ${{ matrix.claude-code }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 2.1.288 is the minimum that README.md names. 2.1.296 is the version the mod is tested with.
+        claude-code: ["2.1.288", "2.1.296"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Claude Code
+        env:
+          CLAUDE_CODE_VERSION: ${{ matrix.claude-code }}
+        run: |
+          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          claude --version
+
+      - name: Dry-run the release tag
+        # Checks that plugin.json has a version and that the marketplace entry agrees with it.
+        # The checkout has no tags, so a tag that already exists does not fail this step.
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --short
+            echo "::error::the checkout is not clean"
+            exit 1
+          fi
+          claude plugin tag --dry-run .
+
+      - name: Validate the manifests
+        # Fails on any error, and on any warning except one: CLAUDE.md at the plugin root.
+        # Older versions validate only marketplace.json for ".", so plugin.json is then validated alone.
+        run: |
+          status=0
+          check() {
+            local target=$1 report problems
+            if ! report=$(claude plugin validate --json "$target"); then
+              status=1
+            fi
+            if ! jq -e 'type == "object" and has("manifest")' > /dev/null 2>&1 <<< "$report"; then
+              echo "::error::claude plugin validate --json $target printed no report"
+              status=1
+              return
+            fi
+            problems=$(jq -r --arg root "$PWD/" '
+              ([.manifest] + (.contents // []))[]
+              | (.file | ltrimstr($root)) as $file
+              | (.errors[]? | "::error file=\($file)::\(.path): \(.message)"),
+                (.warnings[]?
+                  | select(($file == "CLAUDE.md"
+                      and (.message | startswith("CLAUDE.md at the plugin root is not loaded"))) | not)
+                  | "::error file=\($file)::warning: \(.path): \(.message)")' <<< "$report")
+            if [ -n "$problems" ]; then
+              printf '%s\n' "$problems"
+              status=1
+            fi
+            jq -r --arg root "$PWD/" --arg target "$target" '
+              "claude plugin validate \($target): "
+              + ([.manifest] + (.contents // []) | map(.file | ltrimstr($root)) | join(", "))' <<< "$report"
+            if [ "$target" = . ] && ! jq -e '(.contents // []) | any(.file | endswith("/.claude-plugin/plugin.json"))' \
+              > /dev/null <<< "$report"; then
+              check .claude-plugin/plugin.json
+            fi
+          }
+          check .
+          exit "$status"
+
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # A pull_request run checks out the merge commit. Depth 2 brings its first parent, the base branch.
+          fetch-depth: 2
+
+      - name: Check the version and the README badge
+        # Every event: the version is MAJOR.MINOR.PATCH and line 7 of README.md shows it.
+        # Pull requests: a change to hooks/, types/, or a plugin.json field other than version
+        # must raise the version. A version may never go down.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          manifest=.claude-plugin/plugin.json
+          version=$(jq -r '.version // empty' "$manifest")
+          if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=$manifest::version must be MAJOR.MINOR.PATCH, found '$version'"
+            exit 1
+          fi
+          badge=$(sed -n 7p README.md)
+          if [[ $badge != *"badge/version-$version-"* || $badge != *"alt=\"Version: $version\""* ]]; then
+            echo "::error file=README.md,line=7::the version badge does not show $version"
+            exit 1
+          fi
+          echo "version $version, README badge matches"
+          [ "$EVENT_NAME" = pull_request ] || exit 0
+
+          if ! git rev-parse --verify --quiet 'HEAD^2' > /dev/null; then
+            echo "::error::HEAD is not the pull request merge commit"
+            exit 1
+          fi
+          base_version=$(git show "HEAD^1:$manifest" | jq -r '.version // empty')
+          if [ "$version" != "$base_version" ]; then
+            highest=$(printf '%s\n%s\n' "$base_version" "$version" | sort -V | tail -n 1)
+            if [ "$highest" != "$version" ]; then
+              echo "::error file=$manifest::version $version is lower than $base_version on the base branch"
+              exit 1
+            fi
+            echo "version raised from $base_version to $version"
+            exit 0
+          fi
+          changed=$(git diff --name-only 'HEAD^1' HEAD -- hooks types)
+          if [ "$(git show "HEAD^1:$manifest" | jq -S 'del(.version)')" != "$(jq -S 'del(.version)' "$manifest")" ]; then
+            changed=$(printf '%s\n%s' "$changed" "$manifest")
+          fi
+          if [ -n "$changed" ]; then
+            printf '%s\n' "$changed" | sed '/^$/d; s/^/  /'
+            echo "::error file=$manifest::these files change what users install, so raise version above $version"
+            exit 1
+          fi
+          echo "no change to hooks/, types/ or plugin.json: version $version can stay"
+
+  ci:
+    if: always()
+    needs: [validate, version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" != success ]; then
+              echo "::error::a job ended with: $result"
+              exit 1
+            fi
+          done
+          echo "every job passed"
