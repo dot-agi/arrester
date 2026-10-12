@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.288%2B-D97757" alt="Claude Code 2.1.288+">
   <img src="https://img.shields.io/badge/type-mod-555555" alt="mod">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555555" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/version-1.1.0-555555" alt="Version: 1.1.0">
+  <img src="https://img.shields.io/badge/version-1.1.1-555555" alt="Version: 1.1.1">
 </p>
 
 <p align="center"><strong>Arrester remembers your guards' blocks and stops common detours to the same target.</strong></p>
