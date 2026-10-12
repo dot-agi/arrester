@@ -4,7 +4,7 @@ This guide covers setup, the checks, and how to send a change.
 
 ## Setup
 
-1. Install Claude Code 2.1.288 or later, and Node.js for the type check.
+1. Install Claude Code 2.1.296 or later, and Node.js for the type check.
 2. Clone the repository: `git clone https://github.com/dot-agi/arrester`, then `cd arrester`.
 3. Load the mod once with `claude --plugin-dir .`, then quit. Claude Code writes `.claude-plugin/types/` (the mods API types) and `tsconfig.json`. Both are in `.gitignore`.
 

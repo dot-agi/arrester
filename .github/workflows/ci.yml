@@ -1,5 +1,5 @@
 # CI for a Claude Code mod repository. The same file runs in each mod repository.
-# Jobs: validate the manifests with two Claude Code versions, check the version rule,
+# Jobs: validate the manifests with the minimum Claude Code version, check the version rule,
 # and dry-run the release tag. The job "ci" passes only when every other job passes.
 name: ci
 
@@ -30,8 +30,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 2.1.288 is the minimum that README.md names. 2.1.296 is the version the mod is tested with.
-        claude-code: ["2.1.288", "2.1.296"]
+        # 2.1.296 is the minimum that README.md names and the version the mod is tested with.
+        claude-code: ["2.1.296"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

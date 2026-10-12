@@ -6,21 +6,10 @@ Arrester is a Claude Code mod, plugin `arrester`. After a guard blocks a tool ca
 
 Run these commands from a shell. Each `&&` runs the next step only when the step before it succeeds.
 
-Install with Claude Code 2.1.292 or later. The part after the install turns on auto-update. It runs only when the install succeeds and the marketplace entry exists:
+Install with Claude Code 2.1.296 or later. The part after the install turns on auto-update. It runs only when the install succeeds and the marketplace entry exists:
 
 ```sh
 claude plugin install arrester --marketplace dot-agi/arrester --scope user --json \
-  && f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
-  && jq -e --arg name arrester '.extraKnownMarketplaces[$name].source' "$f" > /dev/null \
-  && tmp=$(mktemp "$f.XXXXXX") \
-  && { jq --arg name arrester '.extraKnownMarketplaces[$name].autoUpdate = true' "$f" > "$tmp" && mv "$tmp" "$f" || { rm -f "$tmp"; false; }; }
-```
-
-Claude Code 2.1.288 to 2.1.291 has no `--marketplace` option. Add the marketplace first, then install, then turn on auto-update:
-
-```sh
-claude plugin marketplace add dot-agi/arrester --scope user --json \
-  && claude plugin install arrester@arrester --scope user --json \
   && f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
   && jq -e --arg name arrester '.extraKnownMarketplaces[$name].source' "$f" > /dev/null \
   && tmp=$(mktemp "$f.XXXXXX") \
