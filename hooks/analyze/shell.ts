@@ -4,7 +4,7 @@
 
 import { scanCode } from './code'
 import type { Dialect } from './code'
-import { heredocWord, lex, UNPARSED, wordText } from './lexer'
+import { heredocWord, lex, spellingOf, TOO_LONG, UNPARSED, unknownSource, wordText } from './lexer'
 import type { Part, Redirect, Token, Word } from './lexer'
 import { absolute, basenameOf, dirnameOf, expandBraces, globMatch, hasGlob, isRemote, joinPath, looksLikePath, MAX_PATH, PATH_TOO_LONG, selectionKey, selectionNames, selectionPossible, splitGlob } from './paths'
 import type { Meter } from './paths'
@@ -48,13 +48,19 @@ const MAX_TEXT = 100_000
 /** The most work one analysis does, in characters read, characters built, and values copied; past it the analysis stops and is opaque. */
 const MAX_WORK = 4_000_000
 
+/** The most work that the code of 1.2.0 does for one call, across both walks: each token, word character, tree node, copied entry, queue step, and table lookup of rule A4, its second walk, the newer reading, the array rule, and the profile. Past it the analysis stops and is opaque. */
+const NEW_WORK = 1_500_000
+
+/** The longest call that the code of 1.2.0 reads: a longer call that needs the newer reading keeps the result of 1.1.3, which did not parse it, and a longer call that runs a function that it defines, which rule A4 walks a second time, is opaque. */
+const NEW_LENGTH = 10_000
+
 /** One word value: its text, whether it represents glob matches, and a pattern that preserves quoted wildcard positions. */
 type Value = { selected?: true; text: string; glob: boolean; pattern?: string; globOptions?: Effect['globOptions']; selection?: Effect['selection'] }
 
 /** A word as the walker sees it: its text as typed, and its values (undefined when it does not resolve); `upstream` marks an operand that reaches below its paths, as one that `xargs` or `find -exec` takes from what came before; `process` marks a process substitution, whose generated file name is unknown; `possible` holds, for a word that does not resolve, the values that the default or the alternate of a parameter operator gives it. */
 type Operand = { raw: string; values: Value[] | undefined; upstream?: true; process?: true; possible?: Value[] }
 
-/** The shell state one command line runs in; `reaching` names the variables bound to operands that reach below their paths; `possible` holds the possible values of a variable that has no known value, from an assignment of a parameter operator's default; `functions` holds the bodies of the functions defined so far and `named` the text of each alias. The links made and the files written are on disk, so every copy shares them. */
+/** The shell state one command line runs in; `reaching` names the variables bound to operands that reach below their paths; `possible` holds the possible values of a variable that has no known value, from an assignment of a parameter operator's default; `functions` holds the bodies of the functions defined so far and `named` the text of each alias; `arrays` holds the elements of each array whose expansions resolve, as `assignArray` says; `lost` marks a shell where `HOME` and `PWD` are unknown, as `forgetAssigned` says. The links made and the files written are on disk, so every copy shares them. */
 type State = {
   status?: boolean
   terminated?: boolean
@@ -77,13 +83,15 @@ type State = {
   functions: Map<string, Simple>
   named: Map<string, string>
   possible: Map<string, Value[]>
+  arrays: Map<string, Operand[]>
+  lost?: true
 }
 
 /** The printing options on a shell's command line, in order: `verbose` prints the code that the shell reads, and `xtrace` the commands that it runs. */
 type Printing = { verbose?: boolean; xtrace?: boolean }
 
-/** One command with its redirections and optional compound body; `definition` names the function that the command defines, or is empty for a name that is not plain text, and `exits` marks a function body that names `return` or `exit`. */
-type Simple = { words: Word[]; redirects: Redirect[]; body?: Pipeline[]; subshell?: boolean; branches?: { condition?: Pipeline[]; body: Pipeline[] }[]; definition?: string; exits?: true; loop?: { condition?: Pipeline[]; until?: boolean; name?: string; words?: Word[] } }
+/** One command with its redirections and optional compound body; `definition` names the function that the command defines, or is empty for a name that is not plain text, and `exits` marks a function body that names `return` or `exit`. `arithmetic` marks a subshell whose `(` another `(` follows at once, as in `((`, as `arithmeticOf` says. `cases` holds the word and the branches of a `case`, each with its patterns, its body, and the operator that ends it. */
+type Simple = { words: Word[]; redirects: Redirect[]; body?: Pipeline[]; subshell?: boolean; arithmetic?: true; branches?: { condition?: Pipeline[]; body: Pipeline[] }[]; definition?: string; exits?: true; loop?: { condition?: Pipeline[]; until?: boolean; name?: string; words?: Word[] }; cases?: { word: Word; clauses: { patterns: Word[]; body: Pipeline[]; end: string }[] } }
 
 /** One pipeline and the operator that follows it. */
 type Pipeline = { commands: Simple[]; negate: boolean; after: string }
@@ -101,6 +109,9 @@ const NONE: Stdin = { kind: 'none' }
 const OTHER: Stdin = { kind: 'other' }
 const CLOSED: Stdin = { kind: 'other', closed: true }
 const DECODER: Stdin = { kind: 'decoder' }
+
+/** The value of a variable that rule A4 made unknown, as `setUnknown` says: a join of two shells keeps it unknown, and an assignment replaces it. */
+const UNKNOWN: Value[] = []
 
 /** A command's flags and the values of its value-taking flags. */
 type Options = { flags: string[]; given: Map<string, Operand[]>; ordered: { flag: string; value: Operand }[] }
@@ -130,10 +141,49 @@ class Walk {
   work = 0
   /** The aliases whose text is being walked, which do not expand again inside it. */
   readonly expanding = new Set<string>()
+  /** Set once code that Arrester 1.1.3 did not parse parsed in the modern reading, which then reads all later code of the call, as `parseCommands` says. */
+  modern = false
+  /** How many scripts that the call wrote are being walked; their code keeps the reading of Arrester 1.1.3. */
+  legacy = 0
+  /** Set when code read as Arrester 1.1.3 read it ended a substitution at the `)` of a `case` pattern, which can hide the commands of the `case`; such a call that also needed the modern reading is opaque, as `walkCall` says. */
+  cut = false
+  /** Set when the walk met code that the narrow reading does not follow: an array form that does not resolve, outside an older script; a call of a function whose body is not walked; a `case` with a `;&` or `;;&` end; a command that a wrapper runs whose name is not literal text or is a builtin outside the profile; a read or a write of a file operand that does not resolve, or of a relative path in an unknown folder; or a loop that can read more than one line of literal input. Such a call that also needed the modern reading is opaque, as `walkCall` says. */
+  unread = false
+  /** The command trees that the walk parsed, outside an older script, which `walkCall` checks with `outsideProfile` once the call needs the modern reading. */
+  readonly parsed: Pipeline[][] = []
+  /** Set when a text that the walk parsed, outside an older script, holds `$'…'` or `$"…"`, which the profile does not hold. */
+  quoting = false
+  /** The names of the arrays that the code read so far assigns or declares; an expansion of one of them that does not resolve is opaque. */
+  readonly arrayNames = new Set<string>()
+  /** The arrays whose expansions resolve: each one that the call assigns one time, at its top level, with `NAME=( … )`, and changes nowhere, as `arraysOf` says. */
+  readonly resolvable = new Set<string>()
+  /** The top-level commands that assign the arrays in `resolvable`. */
+  readonly assignments = new Set<Simple>()
+  /** Every body that the code defines for each function name, for rule A4. */
+  readonly bodies = new Map<string, Set<Simple>>()
+  /** Set when a command calls a function that the code defines, so `analyzeShell` walks the call again. */
+  calls = false
+  /** Whether a call of a function makes unknown the variables that its body can assign, as `forgetAssigned` says; only the second walk does. */
+  readonly forgets: boolean
+  /** The work of the code of 1.2.0 so far, which both walks of a call share, as NEW_WORK says. */
+  readonly meter: { used: number }
+  /** The length of the text of the call, as NEW_LENGTH says. */
+  length = 0
 
-  constructor(home: string | undefined, io: Io) {
+  constructor(home: string | undefined, io: Io, forgets = false, meter = { used: 0 }) {
     this.home = home
     this.io = io
+    this.forgets = forgets
+    this.meter = meter
+  }
+
+  /** Counts `units` of the work of the code of 1.2.0; past NEW_WORK the analysis stops and is opaque, as past MAX_WORK. */
+  tick(units: number): boolean {
+    this.meter.used += units
+    if (this.meter.used <= NEW_WORK) return true
+    this.opaque ??= OPAQUE.tooMany
+    this.work = MAX_WORK + 1
+    return false
   }
 
   /** Marks the analysis opaque, or inside an older script records what was not counted; the first reason stays. */
@@ -142,13 +192,14 @@ class Walk {
     else this.ignored ??= { path: this.oldScript, reason }
   }
 
-  /** Charges `units` of work; past MAX_WORK the analysis stops and is opaque, inside an older script too, since the rest of the call goes unread. */
+  /** Charges `units` of work; past MAX_WORK the analysis stops and is opaque, inside an older script too, since the rest of the call goes unread. The whole second walk, and the walk of code once the call needs the newer reading, is work of 1.2.0, so there each unit also counts on the meter. */
   charge(units: number): boolean {
     if (this.io.signal.aborted) {
       this.opaque ??= OPAQUE.interrupted
       this.work = MAX_WORK + 1
       return false
     }
+    if ((this.forgets || this.modern) && !this.tick(units)) return false
     this.work += units
     if (this.work <= MAX_WORK) return true
     this.opaque ??= OPAQUE.tooMany
@@ -184,6 +235,8 @@ class Walk {
 type Run = { walk: Walk; state: State; program: string; args: Operand[]; stdin: Stdin; find?: { starts: Operand[]; expression: FindTerm[] } }
 
 const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)(\+?)=/
+/** An assignment of one element of an array, `NAME[…]=` or `NAME[…]+=`. */
+const ELEMENT = /^([A-Za-z_][A-Za-z0-9_]*)\[[^\]]*\]\+?=/
 const ASSIGNERS = new Set(['export', 'declare', 'local', 'readonly'])
 const DIRECTORY_CHANGERS = new Set(['cd', 'pushd', 'popd'])
 const DEVICES = /^\/dev\/(null|stdout|stderr|tty|fd\/[0-9]+)$/
@@ -198,28 +251,45 @@ const IN_PLACE_CLUSTER = /^-[A-Za-z]*[iI]$/
 const CLAUDE_NAME = /^claude(?:-code)?$/i
 const CLAUDE_VERSION = /\/claude\/versions\/[^/]+$/i
 
-/** Analyzes one shell command line. */
+/** Analyzes one shell command line. A call that runs a function that it defines is walked a second time, where a call makes unknown the variables that its body can assign (rule A4); the effects of both walks count, and either one can make the call opaque, so the rule only adds stops. The retry skeletons are those of the first walk, which reads calls as Arrester 1.1.3 did. */
 export async function analyzeShell(command: string, ctx: Context, io: Io): Promise<Analysis> {
-  const walk = new Walk(ctx.home, io)
-  await runText(walk, command, freshState(ctx.cwd))
+  const walk = await walkCall(command, ctx, io, false)
+  if (walk.calls && walk.opaque === undefined && !io.signal.aborted && command.length > NEW_LENGTH) walk.fail(TOO_LONG)
+  else if (walk.calls && walk.opaque === undefined && !io.signal.aborted) {
+    const second = await walkCall(command, ctx, io, true, walk.meter)
+    for (const effect of second.effects) walk.add(effect)
+    walk.opaque ??= second.opaque
+    walk.ignored ??= second.ignored
+    walk.bypass ??= second.bypass
+  }
   return { effects: walk.effects, segments: walk.segments, opaque: walk.opaque, ignored: walk.ignored, bypass: walk.bypass }
+}
+
+/** One walk of a command line; with `forgets`, a call makes unknown the variables that its body can assign. A call that needed the modern reading is opaque with the reason of 1.1.3, which did not parse some of its code, when it holds a substitution that the reading of Arrester 1.1.3 ended at the `)` of a `case` pattern, code that the narrow reading does not follow, as `Walk.unread` says, or anywhere in the code that the walk parsed, a construct outside the minimal profile: `$'…'` or `$"…"` (`Walk.quoting`), a backslash-newline in the text of the call, or what `outsideProfile` finds. */
+async function walkCall(command: string, ctx: Context, io: Io, forgets: boolean, meter?: { used: number }): Promise<Walk> {
+  const walk = new Walk(ctx.home, io, forgets, meter)
+  walk.length = command.length
+  await runText(walk, command, freshState(ctx.cwd), NONE, true)
+  if (walk.modern && (walk.cut || walk.unread || walk.quoting || command.includes('\\\n') || walk.parsed.some(commands => outsideProfile(walk, commands) !== undefined))) walk.fail(UNPARSED)
+  return walk
 }
 
 /** A fresh shell with its folder and HOME inherited from the environment. */
 function freshState(cwd: string | undefined): State {
-  return { cwd, prev: undefined, stack: [], positional: [], vars: new Map(), reaching: new Set(), exported: new Set(['HOME']), removed: new Set(), emptyEnv: false, aliases: new Map(), written: new Map(), functions: new Map(), named: new Map(), possible: new Map() }
+  return { cwd, prev: undefined, stack: [], positional: [], vars: new Map(), reaching: new Set(), exported: new Set(['HOME']), removed: new Set(), emptyEnv: false, aliases: new Map(), written: new Map(), functions: new Map(), named: new Map(), possible: new Map(), arrays: new Map() }
 }
 
 /** A copy of the state for a subshell or nested code; the links made and the files written stay shared, as on disk. */
 function fork(walk: Walk, state: State): State {
-  if (!walk.charge(8 * (state.vars.size + state.reaching.size + state.exported.size + state.removed.size + state.functions.size + state.named.size + state.possible.size + 1))) return freshState(state.cwd)
-  return { ...state, vars: new Map(state.vars), reaching: new Set(state.reaching), exported: new Set(state.exported), removed: new Set(state.removed), functions: new Map(state.functions), named: new Map(state.named), possible: new Map(state.possible) }
+  if (!walk.charge(8 * (state.vars.size + state.reaching.size + state.exported.size + state.removed.size + state.functions.size + state.named.size + state.possible.size + state.arrays.size + 1))) return freshState(state.cwd)
+  if (!walk.tick(1 + state.arrays.size)) return freshState(state.cwd)
+  return { ...state, vars: new Map(state.vars), reaching: new Set(state.reaching), exported: new Set(state.exported), removed: new Set(state.removed), functions: new Map(state.functions), named: new Map(state.named), possible: new Map(state.possible), arrays: new Map(state.arrays) }
 }
 
-/** The state of a child process: exported variables and their possible values, the functions, and the shared files, in the current folder. */
+/** The state of a child process: exported variables and their possible values, the functions, and the shared files, in the current folder; arrays do not pass to it. */
 function sharedFresh(walk: Walk, state: State): State {
   if (!walk.charge(state.exported.size + state.removed.size + state.functions.size + 1)) return freshState(state.cwd)
-  const child = { ...freshState(state.cwd), execdir: state.execdir, aliases: state.aliases, written: state.written, removed: new Set(state.removed), emptyEnv: state.emptyEnv, functions: new Map(state.functions) }
+  const child = { ...freshState(state.cwd), execdir: state.execdir, aliases: state.aliases, written: state.written, removed: new Set(state.removed), emptyEnv: state.emptyEnv, functions: new Map(state.functions), ...(state.lost ? { lost: true as const } : {}) }
   child.exported = new Set(state.exported)
   if (!state.exported.has('HOME')) child.removed.add('HOME')
   for (const name of state.exported) {
@@ -232,12 +302,68 @@ function sharedFresh(walk: Walk, state: State): State {
   return child
 }
 
-/** Lexes and walks a piece of shell text. */
-async function runText(walk: Walk, text: string, state: State, input: Stdin = NONE): Promise<void> {
+/** Reads and walks a piece of shell text; `top` marks the text of the call itself. */
+async function runText(walk: Walk, text: string, state: State, input: Stdin = NONE, top = false): Promise<void> {
   if (!walk.charge(text.length)) return
-  const lexed = lex(text)
-  if ('error' in lexed) walk.fail(lexed.error)
-  else await runTokens(walk, lexed.tokens, state, input)
+  const commands = parseCommands(walk, modern => lex(text, modern), top)
+  if (commands !== undefined) await runList(walk, commands, state, input)
+}
+
+/** The tokens of a piece of shell text, or why it cannot be read. */
+type Lexed = ReturnType<typeof lex>
+
+/** The commands of a piece of shell text, read as Arrester 1.1.3 read it, else in the modern reading, which adds `case` and arrays; undefined when neither reading parses, which fails with the reason of the 1.1.3 reading. Once a modern reading parsed, the call stopped on 1.1.3, so later code reads in the modern reading only. An older script and a script that the call wrote keep the 1.1.3 reading. Each tree that it returns outside an older script goes to `walk.parsed`. `tokens` gives the tokens of each reading; `top` marks the text of the call itself. */
+function parseCommands(walk: Walk, tokens: (modern: boolean) => Lexed, top = false): Pipeline[] | undefined {
+  const keeps = walk.oldScript !== undefined || walk.legacy > 0
+  let reason: string | undefined
+  if (keeps || !walk.modern) {
+    const lexed = tokens(false)
+    const commands = readCommands(lexed, false)
+    if (typeof commands !== 'string') {
+      if ('legacy' in lexed) walk.cut = true
+      if (walk.oldScript === undefined) {
+        walk.parsed.push(commands)
+        if ('quoting' in lexed) walk.quoting = true
+      }
+      return commands
+    }
+    reason = commands
+    if (keeps) {
+      walk.fail(reason)
+      return undefined
+    }
+  }
+  if (walk.length > NEW_LENGTH) {
+    walk.fail(reason ?? UNPARSED)
+    return undefined
+  }
+  const lexed = tokens(true)
+  if (!walk.tick(tokenWork(lexed))) return undefined
+  const commands = readCommands(lexed, true)
+  if (typeof commands === 'string') {
+    walk.fail(reason ?? commands)
+    return undefined
+  }
+  walk.modern = true
+  arraysOf(walk, commands, top)
+  walk.parsed.push(commands)
+  if ('quoting' in lexed) walk.quoting = true
+  return commands
+}
+
+/** The work of one reading of a text: one for each token, and the length of each word. */
+function tokenWork(lexed: Lexed): number {
+  if ('error' in lexed) return 1
+  let work = 1
+  for (const token of lexed.tokens) work += 1 + (token.type === 'word' ? wordText(token.word).length : 0)
+  return work
+}
+
+/** The commands of the tokens in one reading, or why they do not parse. */
+function readCommands(lexed: Lexed, modern: boolean): Pipeline[] | string {
+  if ('error' in lexed) return lexed.error
+  try { return new Commands(lexed.tokens, modern).list() }
+  catch (error) { return error instanceof Error ? error.message : UNPARSED }
 }
 
 /** Walks code one level deeper; past MAX_DEPTH the analysis is opaque. */
@@ -259,7 +385,7 @@ function newList(): List {
   return { count: 0, isPure: true, isMoved: false }
 }
 
-/** Keeps bounded variable alternatives when a conditional command may have been skipped. */
+/** Keeps bounded variable alternatives when a conditional command may have been skipped; a variable that one side made unknown, as `setUnknown` says, stays unknown. Where only one side has values, the walk of 1.1.3 keeps them, and outside an older script that join marks the walk `unread`, or, once the call needs the newer reading, makes the variable unknown. */
 function mergeVariables(walk: Walk, state: State, before: State): void {
   if (state.terminated) {
     Object.assign(state, before)
@@ -269,9 +395,20 @@ function mergeVariables(walk: Walk, state: State, before: State): void {
   if (!walk.charge(state.vars.size + before.vars.size + state.removed.size + before.removed.size + state.exported.size + before.exported.size)) return
   const names = new Set([...state.vars.keys(), ...before.vars.keys(), ...state.removed, ...before.removed])
   for (const name of names) {
+    if (state.vars.get(name) === UNKNOWN || before.vars.get(name) === UNKNOWN) {
+      setUnknown(state, name)
+      continue
+    }
     const previous = variable(walk, before, name)
     const current = variable(walk, state, name)
     if (previous === current) continue
+    if ((previous === undefined || current === undefined) && walk.oldScript === undefined) {
+      if (walk.modern) {
+        setUnknown(state, name)
+        continue
+      }
+      walk.unread = true
+    }
     const values = alternatives(walk, [...previous ?? [], ...current ?? []])
     if (values.length > MAX_VALUES) {
       walk.fail(OPAQUE.tooMany)
@@ -293,6 +430,8 @@ function mergeVariables(walk: Walk, state: State, before: State): void {
   state.globOptions = { dot: before.globOptions?.dot || state.globOptions?.dot, nocase: before.globOptions?.nocase || state.globOptions?.nocase }
   state.noglob = state.noglob && before.noglob
   state.globstar = state.globstar || before.globstar
+  if (before.lost) state.lost = true
+  if (walk.tick(1 + state.arrays.size)) for (const [name, elements] of state.arrays) if (before.arrays.get(name) !== elements) state.arrays.delete(name)
   state.status = undefined
 }
 
@@ -316,12 +455,18 @@ function mergePositional(walk: Walk, state: State, before: State): void {
   setPositional(walk, state, merged)
 }
 
-/** Parses compound boundaries before execution, with a fixed nesting limit. */
+/** The builtins after which an array assignment parses, when a flag with `a` or `A` comes before it. */
+const ARRAY_DECLARERS = new Set(['declare', 'local', 'typeset', 'readonly'])
+
+/** The operators that end a `case` branch. */
+const CASE_ENDS = [';;', ';&', ';;&']
+
+/** Parses compound boundaries before execution, with a fixed nesting limit; with `modern`, it also parses `case`, and an array assignment parses only where `checkArrays` says, never in a `for` list, a `case` word or pattern, or a redirection. */
 class Commands {
   private at = 0
   private depth = 0
 
-  constructor(private readonly tokens: readonly Token[]) {}
+  constructor(private readonly tokens: readonly Token[], private readonly modern = false) {}
 
   /** Returns an unquoted keyword or a control operator at the cursor. */
   private text(offset = 0): string {
@@ -377,9 +522,11 @@ class Commands {
       return { ...body, definition: name, ...(this.tokens.slice(start, this.at).some(namesExit) ? { exits: true as const } : {}) }
     }
     if (text === '(' || text === '{') {
+      const opening = this.tokens[this.at]
       this.at += 1
       command.body = this.list([text === '(' ? ')' : '}'])
       command.subshell = text === '('
+      if (opening?.type === 'op' && opening.joined === true) command.arithmetic = true
       this.take(text === '(' ? ')' : '}')
     } else if (text === 'while' || text === 'until') {
       this.at += 1
@@ -419,7 +566,8 @@ class Commands {
         command.branches.push({ body: this.list(['fi']) })
       }
       this.take('fi')
-    } else {
+    } else if (this.modern && text === 'case') command.cases = this.caseOf()
+    else {
       while (this.at < this.tokens.length) {
         const token = this.tokens[this.at] as Token
         if (token.type === 'op') break
@@ -428,24 +576,66 @@ class Commands {
         this.at += 1
       }
       if (command.words.length === 0 && command.redirects.length === 0) throw new Error(UNPARSED)
+      if (this.modern) checkArrays(command.words)
     }
     while (this.tokens[this.at]?.type === 'redirect') {
       command.redirects.push((this.tokens[this.at] as { type: 'redirect'; redirect: Redirect }).redirect)
       this.at += 1
     }
+    if (this.modern && [...command.loop?.words ?? [], ...command.redirects.map(redirect => redirect.target)].some(isArray)) throw new Error(UNPARSED)
     return command
+  }
+
+  /** Reads `case WORD in … esac` from the `case` at the cursor: newlines may come before `in` and between branches; each branch has patterns joined by `|`, with an optional `(` before them and a `)` after, a body, and `;;`, `;&`, or `;;&`, which the last branch may leave out before `esac`. */
+  private caseOf(): NonNullable<Simple['cases']> {
+    this.at += 1
+    const word = this.tokens[this.at]
+    if (word?.type !== 'word') throw new Error(UNPARSED)
+    this.at += 1
+    this.newlines()
+    this.take('in')
+    const clauses: NonNullable<Simple['cases']>['clauses'] = []
+    for (;;) {
+      this.newlines()
+      if (this.text() === 'esac') break
+      if (this.text() === '(') this.at += 1
+      const patterns: Word[] = []
+      for (;;) {
+        const pattern = this.tokens[this.at]
+        if (pattern?.type !== 'word') throw new Error(UNPARSED)
+        patterns.push(pattern.word)
+        this.at += 1
+        if (this.text() !== '|') break
+        this.at += 1
+      }
+      this.take(')')
+      const body = this.list([...CASE_ENDS, 'esac'])
+      const end = this.text()
+      if (end !== 'esac' && !CASE_ENDS.includes(end)) throw new Error(UNPARSED)
+      clauses.push({ patterns, body, end: end === 'esac' ? ';;' : end })
+      if (end === 'esac') break
+      this.at += 1
+    }
+    this.take('esac')
+    if ([word.word, ...clauses.flatMap(clause => clause.patterns)].some(isArray)) throw new Error(UNPARSED)
+    return { word: word.word, clauses }
+  }
+
+  /** Skips newlines at the cursor. */
+  private newlines(): void {
+    while (this.tokens[this.at]?.type === 'op' && (this.tokens[this.at] as { op: string }).op === '\n') this.at += 1
   }
 }
 
-/** Parses a token stream, then walks only the command bodies that can execute. */
-async function runTokens(walk: Walk, tokens: readonly Token[], state: State, input: Stdin): Promise<Stdin> {
-  let commands: Pipeline[]
-  try { commands = new Commands(tokens).list() }
-  catch (error) {
-    walk.fail(error instanceof Error ? error.message : UNPARSED)
-    return OTHER
+/** Checks that each array assignment of a simple command stands where the shell reads one: in a command of assignments only, or after `declare`, `local`, `typeset`, or `readonly` with a flag that holds `a` or `A`. */
+function checkArrays(words: readonly Word[]): void {
+  const leading = leadingAssignments(words)
+  const program = wordText(words[leading] ?? [])
+  let flagged = false
+  for (const [index, word] of words.entries()) {
+    if (word.some(part => part.kind === 'array') && leading !== words.length && !(index > leading && ARRAY_DECLARERS.has(program) && flagged)) throw new Error(UNPARSED)
+    if (index > leading && /^-[A-Za-z]*[aA]/.test(wordText(word))) flagged = true
   }
-  return runList(walk, commands, state, input)
 }
 
 /** Walks and-or lists while preserving skipped status and bounded variable alternatives. */
@@ -498,9 +688,10 @@ async function runList(walk: Walk, commands: readonly Pipeline[], state: State, 
   return output
 }
 
-/** Executes a group or an if branch, merging state only when a condition is unknown. */
+/** Executes a group, a `case`, or an if branch, merging state only when a condition is unknown. */
 async function runCompound(walk: Walk, command: Simple, state: State, input: Stdin): Promise<Stdin> {
   if (command.loop !== undefined) return runLoop(walk, command, state, input)
+  if (command.cases !== undefined) return runCase(walk, command.cases, state, input)
   if (command.body !== undefined) {
     const scope = command.subshell ? fork(walk, state) : state
     const output = await runList(walk, command.body, scope, input)
@@ -542,7 +733,50 @@ async function runCompound(walk: Walk, command: Simple, state: State, input: Std
   return output
 }
 
-/** Runs the stages of one pipeline, handing each stage what the one before produced. Each stage of a longer pipeline runs in a subshell, and a folder change in the last stage leaves the folder unknown, since some shells run that stage in this one. */
+/** Walks a `case`: the commands in its word and its patterns run, and a pattern is no path. Every branch counts, as a branch of an `if` whose condition is unknown does, each in a copy of the shell, and the copies join the shell where no pattern matched, as at an `if`. A branch that `;&` ends also starts the next branch, and one that `;;&` ends every later branch, so their shells join the start of those branches; the narrow reading does not follow the input that such a branch passes on, so such an end marks the walk `unread`. */
+async function runCase(walk: Walk, cases: NonNullable<Simple['cases']>, state: State, input: Stdin): Promise<Stdin> {
+  const cache: Substituted = new Map()
+  await resolveWhole(walk, cases.word, state, cache)
+  if (cases.clauses.some(clause => clause.end !== ';;')) walk.unread = true
+  const ends: State[] = []
+  const later: State[] = []
+  const positions: number[] = []
+  let next: State | undefined
+  for (const clause of cases.clauses) {
+    if (!walk.charge(1 + later.length) || !walk.tick(1 + later.length + clause.patterns.length)) return OTHER
+    for (const pattern of clause.patterns) await resolveWhole(walk, pattern, state, cache)
+    const scope = fork(walk, state)
+    for (const other of next === undefined ? later : [...later, next]) {
+      if (other.terminated) continue
+      mergeVariables(walk, scope, other)
+      if (scope.cwd !== other.cwd) scope.cwd = undefined
+    }
+    const before = input.kind === 'literal' ? input.positions ?? [0] : []
+    await runList(walk, clause.body, scope, input)
+    if (input.kind === 'literal') {
+      if (!scope.terminated && walk.charge(input.positions?.length ?? 1)) positions.push(...input.positions ?? [0])
+      input.positions = before
+    }
+    ends.push(scope)
+    if (clause.end === ';;&') later.push(scope)
+    next = clause.end === ';&' ? scope : undefined
+  }
+  mergeInput(walk, input, positions)
+  state.status = true
+  let output = NONE
+  for (const end of ends) {
+    if (end.terminated) continue
+    mergeVariables(walk, state, end)
+    if (state.cwd !== end.cwd) state.cwd = undefined
+    output = OTHER
+  }
+  return output
+}
+
+/** The names of the positional and special parameters, which a call does not make unknown. */
+const POSITIONAL = /^(?:[0-9]+|[@*#?$!-])$/
+
+/** Runs the stages of one pipeline, handing each stage what the one before produced. Each stage of a longer pipeline runs in a subshell, and a folder change in the last stage leaves the folder unknown, since some shells run that stage in this one; for the same reason, rule A4 applies to each call of a function or an alias in the last stage, as `forgetAssigned` says. */
 async function runPipeline(walk: Walk, commands: readonly Simple[], state: State, input: Stdin): Promise<Stdin> {
   const [only] = commands
   if (commands.length === 1 && only !== undefined) {
@@ -560,6 +794,10 @@ async function runPipeline(walk: Walk, commands: readonly Simple[], state: State
   }
   if (last.cwd !== state.cwd) state.cwd = undefined
   state.status = last.status
+  if (walk.forgets) {
+    const calls = changesOf(walk, [{ commands: commands.slice(-1), negate: false, after: '' }], noChanges(true)).calls
+    forgetAssigned(walk, state, [...calls].filter(name => walk.bodies.has(name) || state.named.has(name)))
+  }
   return piped
 }
 
@@ -578,25 +816,34 @@ function namesExit(token: Token): boolean {
   return token.type === 'redirect' && (EXITS.test(wordText(token.redirect.target)) || EXITS.test(token.redirect.heredoc?.text ?? ''))
 }
 
-/** Runs one simple command: assignments, wrappers, the program, and the redirections; returns what it hands the next stage. A function definition is kept for its calls, unless its body names `return` or `exit`, which forgets the name; a command whose program word names an alias also walks the alias text with the rest of the command. */
+/** Runs one simple command: assignments, wrappers, the program, and the redirections; returns what it hands the next stage. A function definition is kept for its calls, unless its body names `return` or `exit`, which forgets the name; every body stays known for rule A4, which `forgetAssigned` applies after a call in the second walk. A command whose program word names an alias also walks the alias text with the rest of the command. An array assignment walks as `assignArray` says. */
 async function runSimple(walk: Walk, command: Simple, state: State, piped: Stdin): Promise<Stdin> {
   if (command.definition !== undefined) {
+    if (command.definition !== '' && walk.tick(1)) {
+      const bodies = walk.bodies.get(command.definition) ?? new Set<Simple>()
+      bodies.add(command)
+      walk.bodies.set(command.definition, bodies)
+    }
     if (command.exits) state.functions.delete(command.definition)
     else if (command.definition !== '' && walk.charge(1)) state.functions.set(command.definition, { ...command, definition: undefined })
     state.status = true
     return NONE
   }
   const outer = state
+  const original = command
   const cache: Substituted = new Map()
   let start = 0
   while (KEYWORDS.has(wordText(command.words[start] ?? []))) start += 1
   if (start > 0) command = { ...command, words: command.words.slice(start) }
   const leading = leadingAssignments(command.words)
-  await expandAlias(walk, command, leading, state, piped)
+  const alias = await expandAlias(walk, command, leading, state, piped)
   const isDeclaration = ASSIGNERS.has(wordText(command.words[leading] ?? []))
   const words: Operand[] = []
   for (const word of command.words.slice(leading)) {
-    if (isDeclaration && ASSIGNMENT.test(wordText(word))) words.push(await resolveWhole(walk, word, state, cache))
+    if (isArray(word)) {
+      await assignArray(walk, original, word, state, cache)
+      words.push({ raw: wordText(word), values: undefined })
+    } else if (isDeclaration && ASSIGNMENT.test(wordText(word))) words.push(await resolveWhole(walk, word, state, cache))
     else for (const field of await resolveFields(walk, word, state, cache)) words.push(field)
   }
   const redirects: Redirected[] = []
@@ -613,17 +860,26 @@ async function runSimple(walk: Walk, command: Simple, state: State, piped: Stdin
   }
   if (leading > 0 && words.length > 0) state = fork(walk, state)
   for (const word of command.words.slice(0, leading)) {
+    if (isArray(word)) {
+      await assignArray(walk, original, word, state, cache)
+      continue
+    }
     const setting = await resolveWhole(walk, word, state, cache)
     assign(walk, state, setting)
     if (words.length > 0) state.exported.add(ASSIGNMENT.exec(setting.raw)![1]!)
   }
   const stdin = stdinOf(redirects, state.cwd, piped) ?? piped
-  if (command.body !== undefined || command.branches !== undefined) {
+  if (command.body !== undefined || command.branches !== undefined || command.cases !== undefined) {
     const output = await runCompound(walk, command, state, stdin)
     finishRedirects(redirectRun, descriptors, output)
     return descriptors.get(1) === 'stdout' ? output : NONE
   }
   const result = await runCommand(walk, words, state, stdin)
+  if (result.called !== undefined) {
+    walk.calls = true
+    if (walk.forgets) forgetAssigned(walk, outer, [result.called])
+  }
+  if (alias !== undefined && walk.forgets) forgetAssigned(walk, outer, [alias])
   if (state !== outer && ['read', 'printf'].includes(result.program)) {
     const temporary = new Set(command.words.slice(0, leading).map(word => ASSIGNMENT.exec(wordText(word))![1]))
     if (walk.charge(state.vars.size + outer.vars.size)) for (const name of new Set([...state.vars.keys(), ...outer.vars.keys()])) {
@@ -643,33 +899,802 @@ async function runSimple(walk: Walk, command: Simple, state: State, piped: Stdin
   return descriptors.get(1) === 'stdout' ? result.output : NONE
 }
 
-/** Walks the text of the alias that a command's program word names, unquoted, with the command's other words and its redirections after it, one level deeper, in a copy of the shell and of its input, so the command still reads as it does without the alias; an alias does not expand again inside its own text. */
-async function expandAlias(walk: Walk, command: Simple, leading: number, state: State, piped: Stdin): Promise<void> {
+/** Whether a word is an array assignment, `NAME=( … )` or `NAME+=( … )`. */
+function isArray(word: Word): boolean {
+  return word.some(part => part.kind === 'array')
+}
+
+/** Walks an array assignment: its elements resolve now, as the words of a command do, so the commands in them run. The array keeps them, so `"${NAME[@]}"`, `${NAME[@]}`, `"${NAME[*]}"`, and `${NAME[*]}` resolve to them, only when `command` is the top-level command that assigns an array of `walk.resolvable` with `=`. Any other array has elements that Arrester does not know, so an expansion of it is opaque. The name has no known scalar value either. */
+async function assignArray(walk: Walk, command: Simple, word: Word, state: State, cache: Substituted): Promise<void> {
+  const match = ASSIGNMENT.exec(wordText(word))
+  const array = word.find(part => part.kind === 'array')
+  if (match === null || array?.kind !== 'array') return
+  const name = match[1]!
+  const elements: Operand[] = []
+  if (!walk.tick(1 + array.elements.length)) return
+  for (const element of array.elements) elements.push(...await resolveFields(walk, element, state, cache))
+  walk.arrayNames.add(name)
+  state.vars.delete(name)
+  state.possible.delete(name)
+  state.removed.delete(name)
+  state.reaching.delete(name)
+  if (match[2] === '' && walk.assignments.has(command) && walk.resolvable.has(name)) state.arrays.set(name, elements)
+  else state.arrays.delete(name)
+}
+
+/** Records the arrays that a tree of commands assigns, declares with `-a` or `-A`, reads with `read -a`, `read -A`, `mapfile`, or `readarray`, sets with `set -A`, or assigns an element of; for the text of the call itself (`top`), also the arrays whose expansions resolve: an array that one top-level command of assignments only assigns with `NAME=( … )`, unconditionally, once, and with no `[key]=value` element, and that no other code of the call can assign, as `changesOf` counts. A command runs unconditionally when no `&&` or `||` comes before it, nothing runs it in the background or in a pipeline, and no `!` negates it. */
+function arraysOf(walk: Walk, commands: readonly Pipeline[], top: boolean): void {
+  visitCommands(walk, commands, command => {
+    let leading = leadingAssignments(command.words)
+    while (ELEMENT.test(wordText(command.words[leading] ?? []))) {
+      walk.arrayNames.add(ELEMENT.exec(wordText(command.words[leading]!))![1]!)
+      leading += 1
+    }
+    const program = wordText(command.words[leading] ?? [])
+    const args = command.words.slice(leading + 1).map(word => wordText(word))
+    const declares = ['mapfile', 'readarray'].includes(program) || ((ARRAY_DECLARERS.has(program) || program === 'read') && args.some(flag => /^-[A-Za-z]*[aA]/.test(flag)))
+    for (const [index, word] of command.words.entries()) {
+      const name = /^([A-Za-z_][A-Za-z0-9_]*)(?:\+?=|$)/.exec(wordText(word))?.[1]
+      if (name !== undefined && (isArray(word) || (declares && index > leading))) walk.arrayNames.add(name)
+    }
+    if (['mapfile', 'readarray'].includes(program)) walk.arrayNames.add('MAPFILE')
+    const set = program === 'set' ? args.findIndex(flag => /^[-+]A$/.test(flag)) : -1
+    if (set >= 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(args[set + 1] ?? '')) walk.arrayNames.add(args[set + 1]!)
+  })
+  if (!top) return
+  const candidates = new Map<string, Simple | undefined>()
+  for (const [index, pipeline] of commands.entries()) {
+    const [only] = pipeline.commands
+    const isConditional = index > 0 && ['&&', '||'].includes(commands[index - 1]!.after)
+    if (only === undefined || pipeline.commands.length > 1 || pipeline.negate || pipeline.after === '&' || isConditional) continue
+    if (only.words.length === 0 || leadingAssignments(only.words) !== only.words.length || !walk.tick(commandWork(only))) continue
+    for (const word of only.words) {
+      const match = ASSIGNMENT.exec(wordText(word))
+      const array = word.find(part => part.kind === 'array')
+      if (match === null || array?.kind !== 'array' || match[2] === '+') continue
+      const keyed = array.elements.some(element => /^\[[^\]]*\]\+?=/.test(wordText(element)))
+      candidates.set(match[1]!, candidates.has(match[1]!) || keyed ? undefined : only)
+    }
+  }
+  if (candidates.size === 0) return
+  const changes = changesOf(walk, commands)
+  if (changes.all) return
+  for (const [name, command] of candidates) {
+    if (command === undefined || changes.names.get(name) !== 1) continue
+    walk.resolvable.add(name)
+    walk.assignments.add(command)
+  }
+}
+
+/** The work of reading one command again: one for the command, and one and the length of each word that the change reads in it: its words, the words of its loop header, the word and the patterns of its `case`, and the target and the heredoc of each redirection. */
+function commandWork(command: Simple): number {
+  let work = 1
+  const words = [...command.words, ...command.loop?.words ?? [], ...command.cases === undefined ? [] : [command.cases.word, ...command.cases.clauses.flatMap(clause => clause.patterns)], ...command.redirects.map(redirect => redirect.target)]
+  for (const word of words) work += 1 + wordText(word).length
+  for (const redirect of command.redirects) work += 1 + (redirect.heredoc?.text.length ?? 0)
+  return work
+}
+
+/** Calls `visit` for each command of a tree: the commands of each pipeline and of the compound bodies, conditions, loops, `case` branches, and function bodies in them, until the work runs out. */
+function visitCommands(walk: Walk, commands: readonly Pipeline[], visit: (command: Simple) => void): void {
+  const pending = commands.flatMap(pipeline => pipeline.commands)
+  while (pending.length > 0) {
+    const command = pending.pop()!
+    const work = commandWork(command)
+    if (!walk.charge(work) || !walk.tick(work)) return
+    visit(command)
+    const lists = [...command.body ?? [], ...command.loop?.condition ?? [], ...(command.branches ?? []).flatMap(branch => [...branch.condition ?? [], ...branch.body]), ...(command.cases?.clauses ?? []).flatMap(clause => clause.body)]
+    for (const pipeline of lists) pending.push(...pipeline.commands)
+  }
+}
+
+/** What code can assign: how many times it names each variable in an assignment, whether it can assign any variable, and the program words that it runs; with `exact`, only what it assigns in the shell that runs it, as `changesOf` says. `locals` names the variables that it declares as a function's own, as DECLARERS says. `shell` names the shell that runs the code, when it is bash or zsh, so its builtins count as that shell's do, as DECLARERS and NAMERS say. `getopts` assigns OPTARG, OPTIND, and only the operand after the option string, or each later operand when the option string is not literal text. */
+type Changes = { names: Map<string, number>; all: boolean; calls: Set<string>; exact: boolean; locals: Set<string>; shell?: Shell }
+
+/** No changes yet; `exact` and `shell` as `Changes` say. */
+function noChanges(exact = false, shell?: Shell): Changes {
+  return { names: new Map(), all: false, calls: new Set(), exact, locals: new Set(), ...(shell === undefined ? {} : { shell }) }
+}
+
+/** The names that the assignments and the arithmetic steps in a text assign, in one pass of linear time. An assignment is a name that no letter, digit, `_`, `$`, or `-` comes before, then white space, an optional subscript up to the next `]` with white space after it, an optional operator (`-`, `+`, `*`, `/`, `%`, `&`, `|`, `^`, `:`, `<<`, or `>>`), and `=` with no `=` after it, as in `NAME=`, `F[0]+=`, and `${NAME:=word}`. A step is such a name, with no `-` rule, before `++` or `--`, or `++` or `--`, white space, and a name. Each found form ends where the next search starts, so the text of a subscript that a found form holds counts no name. One pass from the end gives, for each position, the next `]` and the next character that is no white space, so a subscript or a run of white space costs constant work at each name. Assignments come first, then steps. */
+function arithmeticNames(text: string): string[] {
+  const length = text.length
+  const close = new Int32Array(length + 1)
+  const solid = new Int32Array(length + 1)
+  close[length] = -1
+  solid[length] = length
+  for (let at = length - 1; at >= 0; at -= 1) {
+    const code = text.charCodeAt(at)
+    close[at] = code === 93 ? at : close[at + 1]!
+    solid[at] = isSpace(code) ? solid[at + 1]! : at
+  }
+  const isStart = (at: number): boolean => at < length && isNameStart(text.charCodeAt(at))
+  const nameEnd = (from: number): number => {
+    let to = from
+    while (to < length && isNamePart(text.charCodeAt(to))) to += 1
+    return to
+  }
+  const afterSubscript = (from: number): number | undefined => {
+    if (text[from] !== '[') return from
+    const end = close[from]!
+    return end < 0 ? undefined : solid[end + 1]!
+  }
+  const names: string[] = []
+  for (let at = 0; at < length;) {
+    if (!isStart(at) || (at > 0 && (isNamePart(text.charCodeAt(at - 1)) || text[at - 1] === '$' || text[at - 1] === '-'))) {
+      at += 1
+      continue
+    }
+    const end = nameEnd(at)
+    const operator = afterSubscript(solid[end]!)
+    let after: number | undefined
+    if (operator !== undefined) {
+      if ('-+*/%&|^:'.includes(text[operator] ?? '') && text[operator + 1] === '=' && text[operator + 2] !== '=') after = operator + 2
+      else if ((text.startsWith('<<', operator) || text.startsWith('>>', operator)) && text[operator + 2] === '=' && text[operator + 3] !== '=') after = operator + 3
+      else if (text[operator] === '=' && text[operator + 1] !== '=') after = operator + 1
+    }
+    if (after === undefined) at += 1
+    else {
+      names.push(text.slice(at, end))
+      at = after
+    }
+  }
+  for (let at = 0; at < length;) {
+    if (isStart(at) && (at === 0 || !(isNamePart(text.charCodeAt(at - 1)) || text[at - 1] === '$'))) {
+      const end = nameEnd(at)
+      const step = afterSubscript(solid[end]!)
+      if (step !== undefined && (text.startsWith('++', step) || text.startsWith('--', step))) {
+        names.push(text.slice(at, end))
+        at = step + 2
+        continue
+      }
+    }
+    if ((text.startsWith('++', at) || text.startsWith('--', at)) && isStart(solid[at + 2]!)) {
+      const end = nameEnd(solid[at + 2]!)
+      names.push(text.slice(solid[at + 2]!, end))
+      at = end
+      continue
+    }
+    at += 1
+  }
+  return names
+}
+
+/** A shell whose builtins rule A4 tells apart: bash, also as version 3.2, and zsh. Code that runs in another shell, or where the shell is not known, counts what the builtins of either assign. */
+type Shell = 'bash' | 'zsh'
+
+/** The shells that code with these changes can run in: the one that `bash -c` or `zsh -c` starts, else both. */
+function shellsOf(changes: Changes): readonly Shell[] {
+  return changes.shell === undefined ? ['bash', 'zsh'] : [changes.shell]
+}
+
+/** The signed option letters of a table entry, such as `-g +x`. */
+function optionSet(text = ''): ReadonlySet<string> {
+  return new Set(text.split(' ').filter(Boolean))
+}
+
+/** How one shell's builtin of the declare family reads its options, for rule A4, as the bash 5.3 `help` texts, zshbuiltins(1) of zsh 5.9, and replays in bash 5.3, bash 3.2, and zsh 5.9 show. Each field holds signed option letters. A word with a letter outside `valid` makes the builtin fail and assign nothing; with a letter of `none` it names functions or prints and assigns nothing; with one of `any` it can assign any variable through a name reference; with one of `patterns` its names are patterns, so it can assign any variable when it gives a value or converts. A declaration in a function body is the function's own unless `global` says that the builtin always declares globally or a letter of `globals` comes. A name without a value changes only with a letter of `converts`, as the second name after `-T`, which needs two, or with a letter of `widths` and a width; with `converting` it always changes, unless a letter of `keeps` comes. With `effective`, as in zsh, only the last of `-L` and `+L` counts for a letter L of `globals`, `converts`, `widths`, and `keeps`; else any of them counts. A letter of `any` counts only when its sign comes last. With a letter of `conflicts` after both signs the builtin fails. With `plusOperands`, a word that starts with `+` is an operand; with `digits`, an option word may hold a number. */
+type Declarer = { valid: ReadonlySet<string>; none: ReadonlySet<string>; any: ReadonlySet<string>; patterns: ReadonlySet<string>; globals: ReadonlySet<string>; converts: ReadonlySet<string>; widths: ReadonlySet<string>; keeps: ReadonlySet<string>; conflicts: ReadonlySet<string>; global?: true; converting?: true; effective?: true; plusOperands?: true; digits?: true }
+
+/** A Declarer from its letters as text. */
+function declarer(entry: { valid: string; none?: string; any?: string; patterns?: string; globals?: string; converts?: string; widths?: string; keeps?: string; conflicts?: string; global?: true; converting?: true; effective?: true; plusOperands?: true; digits?: true }): Declarer {
+  return { ...entry, valid: optionSet(entry.valid), none: optionSet(entry.none), any: optionSet(entry.any), patterns: optionSet(entry.patterns), globals: optionSet(entry.globals), converts: optionSet(entry.converts), widths: optionSet(entry.widths), keeps: optionSet(entry.keeps), conflicts: optionSet(entry.conflicts) }
+}
+
+/** The option letters of zsh `local`, after `-` or `+`, as zshbuiltins(1) lists them. */
+const ZSH_LOCAL_LETTERS = [...'aAEFhHilLprRtuUxZ'].flatMap(letter => [`-${letter}`, `+${letter}`]).join(' ')
+
+/** The builtins of the declare family in each shell, as Declarer says. */
+const DECLARERS: Readonly<Record<Shell, ReadonlyMap<string, Declarer>>> = (() => {
+  const bashDeclare = declarer({ valid: '-a -A -c -f -F -g -G -i -I -l -n -p -r -t -u -x +a +A +c +f +F +g +G +i +I +l +n +p +r +t +u +x', none: '-f -F -p +p', any: '-n', globals: '-g -G', conflicts: 'a A' })
+  const bashExport = declarer({ valid: '-a -A -f -n -p', none: '-f', global: true, plusOperands: true })
+  const zshConverts = { converts: '-a -A -E -F -i -l -u', widths: '-L -R -Z', effective: true as const, digits: true as const }
+  const zshTypeset = declarer({ valid: '-a -A -E -f -F -g -h -H -i -k -l -L -m -p -r -R -t -T -u -U -x -z -Z +a +A +E +f +F +g +h +H +i +k +l +L +m +p +r +R +t +u +U +x +z +Z', none: '-f +f -p +p', patterns: '-m +m', globals: '-g -x +x', ...zshConverts })
+  const zshExport = declarer({ valid: '-a -E -f -F -h -H -i -l -L -p -r -R -t -T -u -U -Z +a +E +f +F +h +H +i +l +L +p +r +R +t +u +U +Z', none: '-f +f -p +p', global: true, ...zshConverts })
+  const zshReadonly = declarer({ valid: '-a -A -E -f -F -g -h -H -i -l -L -p -R -t -T -u -U -x -Z +a +A +E +f +F +g +h +H +i +l +L +p +R +t +u +U +x +Z', none: '-f +f -p +p', globals: '-g -x +x', ...zshConverts })
+  const zshInteger = declarer({ valid: '-g -h -H -i -l -L -r -R -t -u -x -Z +g +h +H +i +l +L +r +R +t +u +x +Z', globals: '-g -x +x', converting: true, keeps: '+i', effective: true, digits: true })
+  const zshFloat = declarer({ valid: '-E -F -g -h -H -l -L -r -R -t -u -x -Z +E +F +g +h +H +l +L +r +R +t +u +x +Z', globals: '-g -x +x', converting: true, keeps: '+E', effective: true, digits: true })
+  return {
+    bash: new Map([['declare', bashDeclare], ['typeset', bashDeclare], ['local', bashDeclare], ['export', bashExport], ['readonly', bashExport]]),
+    zsh: new Map([['declare', zshTypeset], ['typeset', zshTypeset], ['local', declarer({ valid: ZSH_LOCAL_LETTERS, none: '-p +p', digits: true })], ['private', declarer({ valid: `${ZSH_LOCAL_LETTERS} -m +m`, none: '-p +p', patterns: '-m +m', digits: true })], ['export', zshExport], ['readonly', zshReadonly], ['integer', zshInteger], ['float', zshFloat]]),
+  }
+})()
+
+/** How one shell's other builtin that names variables reads its arguments, for rule A4, from the same sources as DECLARERS. Each option field holds signed option letters. A word with a letter outside `valid`, when the entry has it, makes the builtin fail and assign nothing, and so does a letter of `none`. A letter of `takes` takes the rest of its word, or else the next word, as its value; the value of a letter of `named` names a variable that the builtin assigns, and that of a letter of `calls` a function that it runs in this shell. A letter of `any` lets it assign any variable, and so does a call without a letter of `listing`, when the entry has it. `operands` says which operands name variables that it assigns, `fixed` the variables that it always assigns, and `fallback` those that it assigns when no operand or option names one. With `strict`, a literal operand that is no name makes it fail: with `fail` it assigns nothing, and with `stop` only the names before that operand; with `prompt`, its first operand may end with `?` and a prompt, and an operand that is a number, which an option before it can take, names nothing. With `pids`, it also assigns NAME_PID for each NAME; with `plusOptions`, a word that starts with `+` holds options, else it is an operand. With `last`, only the last value of its `named` letters counts. With `words`, only those whole words are options, and any other word starts the operands; with `firstOnly`, only its first word can be an option; with `endsAtName`, its options end after a value of a `named` letter, and with `endsWith`, after the word that holds that letter. With `single`, more than one operand makes it fail; so does more than one with the letter `oneWith`, and with the letter `nameless` its operands name nothing. */
+type Assigner = { valid?: ReadonlySet<string>; none: ReadonlySet<string>; takes: ReadonlySet<string>; named: ReadonlySet<string>; calls: ReadonlySet<string>; any: ReadonlySet<string>; listing?: ReadonlySet<string>; operands?: 'all' | 'first'; fixed: readonly string[]; fallback?: (letters: readonly string[]) => readonly string[]; strict?: 'fail' | 'stop'; prompt?: true; pids?: true; plusOptions?: true; last?: true; words?: ReadonlySet<string>; firstOnly?: true; endsAtName?: true; endsWith?: string; single?: true; oneWith?: string; nameless?: string }
+
+/** An Assigner from its letters as text. */
+function assigner(entry: { valid?: string; none?: string; takes?: string; named?: string; calls?: string; any?: string; listing?: string; operands?: 'all' | 'first'; fixed?: string; fallback?: (letters: readonly string[]) => readonly string[]; strict?: 'fail' | 'stop'; prompt?: true; pids?: true; plusOptions?: true; last?: true; words?: string; firstOnly?: true; endsAtName?: true; endsWith?: string; single?: true; oneWith?: string; nameless?: string }): Assigner {
+  return { ...entry, valid: entry.valid === undefined ? undefined : optionSet(entry.valid), none: optionSet(entry.none), takes: optionSet(entry.takes), named: optionSet(entry.named), calls: optionSet(entry.calls), any: optionSet(entry.any), listing: entry.listing === undefined ? undefined : optionSet(entry.listing), fixed: [...optionSet(entry.fixed)], words: entry.words === undefined ? undefined : optionSet(entry.words) }
+}
+
+/** The other builtins that name or assign variables in each shell, as Assigner says. Every other builtin of SHELL_COMMANDS assigns no variable, apart from those of ASSIGNS_ANY and `eval`, `trap`, `alias`, `let`, `[[`, `getopts`, `emulate`, and `zstyle`, which `commandChanges` reads itself. */
+const NAMERS: Readonly<Record<Shell, ReadonlyMap<string, Assigner>>> = (() => {
+  const mapfile = assigner({ valid: '-C -c -d -n -O -s -t -u', takes: '-C -c -d -n -O -s -u', any: '-C', operands: 'first', fallback: () => ['MAPFILE'] })
+  const folder = assigner({ fixed: 'OLDPWD' })
+  const fc = assigner({ takes: '-e', listing: '-l' })
+  const select = assigner({ valid: '', operands: 'first', fixed: 'REPLY' })
+  const zshRead = { none: '-c -e -l', oneWith: '-A', operands: 'all' as const, strict: 'fail' as const, prompt: true as const, fallback: (letters: readonly string[]) => (letters.includes('-A') ? ['reply'] : ['REPLY']) }
+  return {
+    bash: new Map([
+      ['read', assigner({ valid: '-a -d -e -E -i -n -N -p -r -s -t -u', takes: '-a -d -i -n -N -p -t -u', named: '-a', last: true, nameless: '-a', operands: 'all', strict: 'stop', fallback: () => ['REPLY'] })],
+      ['mapfile', mapfile], ['readarray', mapfile],
+      ['printf', assigner({ valid: '-v', takes: '-v', named: '-v', last: true })],
+      ['wait', assigner({ valid: '-f -n -p', takes: '-p', named: '-p', last: true })],
+      ['compgen', assigner({ valid: '-a -A -b -c -C -d -e -f -F -g -G -j -k -o -P -s -S -u -v -V -W -X', takes: '-A -C -F -G -o -P -S -V -W -X', named: '-V', calls: '-F', last: true })],
+      ['unset', assigner({ valid: '-f -n -v', none: '-f', operands: 'all' })],
+      ['enable', assigner({ takes: '-f', any: '-f' })],
+      ['coproc', assigner({ operands: 'first', fixed: 'COPROC COPROC_PID', pids: true })],
+      ['select', select], ['fc', fc], ['cd', folder], ['pushd', folder], ['popd', folder],
+    ]),
+    zsh: new Map([
+      ['read', assigner({ valid: '-A -c -d -e -E -k -l -n -p -q -r -s -t -u -z', takes: '-d -u', ...zshRead })],
+      ['getln', assigner({ valid: '-A -c -e -E -l -n', ...zshRead })],
+      ['printf', assigner({ valid: '-v', words: '-v', takes: '-v', named: '-v', last: true })],
+      ['print', assigner({ valid: '-a -b -c -C -D -e -E -f -i -l -m -n -N -o -O -P -r -R -s -S -u -v -x -X -z', none: '-e -E -s -S -z', takes: '-C -f -u -v -x -X', named: '-v', last: true, endsWith: '-R' })],
+      ['set', assigner({ none: '-b -c -i -j -m -n -q -t -z -Z +b +c +j +q +z', takes: '-A +A -o +o', named: '-A +A', endsAtName: true, plusOptions: true })],
+      ['vared', assigner({ valid: '-a -A -c -e -f -g -h -i -m -M -p -r -t', takes: '-f -i -M -m -p -r -t', operands: 'all', strict: 'fail', single: true })],
+      ['zformat', assigner({ valid: '-a -f -F', takes: '-a -f -F', named: '-a -f -F', firstOnly: true })],
+      ['strftime', assigner({ valid: '-n -q -r -s', takes: '-s', named: '-s' })],
+      ['zstat', assigner({ valid: '-A -f -F -g -H -l -L -n -N -o -r -s -t -T', takes: '-A -f -F -H', named: '-A -H' })],
+      ['unset', assigner({ valid: '-f -m -v', none: '-f', any: '-m', operands: 'all', strict: 'fail' })],
+      ['foreach', assigner({ operands: 'first' })],
+      ['select', select], ['fc', fc], ['cd', folder], ['chdir', folder], ['pushd', folder], ['popd', folder],
+    ]),
+  }
+})()
+
+/** The variables that `=~` in `[[` assigns in each shell. */
+const MATCHES: Readonly<Record<Shell, readonly string[]>> = { bash: ['BASH_REMATCH'], zsh: ['MATCH', 'MBEGIN', 'MEND', 'match', 'mbegin', 'mend'] }
+
+/** The builtins that can assign any variable in each shell: they run code that Arrester does not read at that point, load modules that add parameters, or name variables in ways that it does not follow. */
+const ASSIGNS_ANY: Readonly<Record<Shell, ReadonlySet<string>>> = { bash: new Set(['source', '.']), zsh: new Set(['source', '.', 'r', 'zmodload', 'zparseopts', 'zregexparse']) }
+
+/** The words before a program that run it in this shell. */
+const PREFIXES = new Set(['builtin', 'command', 'time'])
+
+/** The zsh precommand modifiers, which also run the program in this shell; `repeat` takes a count first. */
+const ZSH_PREFIXES = new Set(['noglob', 'nocorrect', '-', 'repeat'])
+
+/** The operators of `[[` whose operands are arithmetic, where an assignment can stand. */
+const ARITHMETIC_TESTS = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge'])
+
+/** What the commands of a tree can assign. By default, in this shell or in a subshell: each assignment and arithmetic step in their text, also in substitutions and in heredocs that the shell expands, `for` loop names, `{NAME}` before a redirection, the names that NAMES_VARIABLES and NAMED_BY_OPTION name, and the code that `eval`, `trap`, and `alias` give. A builtin of ASSIGNS_ANY, a name reference that `-n` declares, a name that is not literal text, a command whose program word is not literal text, which can run any builtin or function, and code that does not parse can assign any variable. With `exact`, as rule A4 counts, only what the commands assign in the shell that runs the tree, and no text that is data: the assignments before a program, `${NAME=word}` and `${NAME:=word}`, the assignments and steps of arithmetic (`$(( … ))`, `(( … ))`, `let`, and the arithmetic operands of `[[`), also in heredocs that the shell expands, `for` loop names, `{NAME}` before a redirection, the names of NAMES_VARIABLES, NAMED_BY_OPTION, and `getopts`, and the code of `eval` and `trap`, but not the text of an `alias` command, which runs only where the alias is used; the code of a subshell, a substitution, a stage of a pipeline before its last, a list in the background, and the body of a function that the tree defines does not count. */
+function changesOf(walk: Walk, commands: readonly Pipeline[], changes: Changes = noChanges(), depth = 0): Changes {
+  const visit = (command: Simple): void => commandChanges(walk, command, changes, depth)
+  if (changes.exact) visitShell(walk, commands, visit)
+  else visitCommands(walk, commands, visit)
+  return changes
+}
+
+/** Calls `visit` for each command of a tree that runs in the shell that runs the tree, as `visitCommands` does, but without the bodies of subshells and of the functions that the tree defines, the stages of a pipeline before its last, and the lists that run in the background. */
+function visitShell(walk: Walk, commands: readonly Pipeline[], visit: (command: Simple) => void): void {
+  const pending: (readonly Pipeline[])[] = [commands]
+  while (pending.length > 0) {
+    const list = pending.pop()!
+    let start = 0
+    if (!walk.tick(list.length)) return
+    for (const [index, pipeline] of list.entries()) {
+      if (['&&', '||'].includes(pipeline.after)) continue
+      const group = list.slice(start, index + 1)
+      start = index + 1
+      if (pipeline.after === '&') continue
+      if (!walk.tick(group.length)) return
+      for (const { commands: stages } of group) {
+        const command = stages[stages.length - 1]
+        if (command === undefined || command.definition !== undefined) continue
+        const work = commandWork(command)
+        if (!walk.charge(work) || !walk.tick(work)) return
+        visit(command)
+        if (command.subshell) continue
+        pending.push(command.body ?? [], command.loop?.condition ?? [], ...(command.branches ?? []).flatMap(branch => [branch.condition ?? [], branch.body]), ...(command.cases?.clauses ?? []).map(clause => clause.body))
+      }
+    }
+  }
+}
+
+/** Adds what one command of a tree can assign to `changes`, as `changesOf` says. */
+function commandChanges(walk: Walk, command: Simple, changes: Changes, depth: number): void {
+  const add = (name: string): void => {
+    changes.names.set(name, (changes.names.get(name) ?? 0) + 1)
+  }
+  if (command.loop?.name !== undefined) add(command.loop.name)
+  const words = [...command.words, ...command.loop?.words ?? [], ...command.cases === undefined ? [] : [command.cases.word, ...command.cases.clauses.flatMap(clause => clause.patterns)], ...command.redirects.map(redirect => redirect.target)]
+  const heredocs = command.redirects.flatMap(redirect => (redirect.heredoc === undefined || redirect.heredoc.quoted ? [] : [redirect.heredoc.text]))
+  if (changes.exact) {
+    for (const word of words) expansionChanges(walk, word, add)
+    for (const text of heredocs) {
+      const read = walk.charge(text.length) ? heredocWord(text, true) ?? heredocWord(text) : undefined
+      if (read === undefined) changes.all = true
+      else expansionChanges(walk, read.word, add)
+    }
+    const arithmetic = arithmeticOf(command)
+    if (arithmetic !== undefined) arithmeticChanges(walk, arithmetic, add)
+  } else {
+    const text = [...words.map(sourceText), ...heredocs].join(' ')
+    if (!walk.charge(text.length) || !walk.tick(4 * text.length)) return
+    for (const name of arithmeticNames(text)) add(name)
+  }
+  if (command.redirects.length > 0) for (const word of command.words) {
+    const named = /^\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(wordText(word))?.[1]
+    if (named !== undefined) add(named)
+  }
+  const textAt = (index: number): string => wordText(command.words[index] ?? [])
+  const shells = shellsOf(changes)
+  if (!walk.tick(shells.length * (1 + command.words.length))) return
+  let at = 0
+  let runs = true
+  while (at < command.words.length) {
+    const text = textAt(at)
+    const assigned = ASSIGNMENT.exec(text)?.[1] ?? ELEMENT.exec(text)?.[1]
+    if (assigned !== undefined) {
+      if (changes.exact) add(assigned)
+      at += 1
+    } else if (KEYWORDS.has(text)) at += 1
+    else if (PREFIXES.has(text) || (ZSH_PREFIXES.has(text) && shells.includes('zsh'))) {
+      if (text === 'command' && !shells.includes('bash')) runs = false
+      at += text === 'repeat' ? 2 : 1
+      while (PREFIXES.has(text) && textAt(at).length > 1 && textAt(at).startsWith('-')) {
+        if (text === 'command' && /^-[A-Za-z]*[vV]/.test(textAt(at))) runs = false
+        at += 1
+      }
+    } else break
+  }
+  const program = command.words[at]?.every(part => part.kind === 'text') === true ? textAt(at) : ''
+  const args = command.words.slice(at + 1)
+  const literal = (word: Word | undefined): boolean => word?.every(part => part.kind === 'text') === true
+  if (program === '') {
+    if (at < command.words.length) changes.all = true
+    return
+  }
+  if (!runs) return
+  changes.calls.add(program)
+  if (shells.some(shell => ASSIGNS_ANY[shell].has(program))) changes.all = true
+  else if (program === 'eval') {
+    if (args.every(literal)) scanText(walk, args.map(wordText).join(' '), changes, depth)
+    else changes.all = true
+  } else if (program === 'trap') {
+    const code = args.find(word => !['-p', '-l', '--'].includes(wordText(word)))
+    if (code !== undefined && literal(code)) scanText(walk, wordText(code), changes, depth)
+    else if (code !== undefined) changes.all = true
+  } else if (program === 'alias' && !changes.exact) {
+    for (const word of args) {
+      if (!literal(word)) changes.all = true
+      else if (wordText(word).includes('=')) scanText(walk, wordText(word).slice(wordText(word).indexOf('=') + 1), changes, depth)
+    }
+  } else if (program === 'let') {
+    if (!args.every(literal)) changes.all = true
+    else if (changes.exact) arithmeticChanges(walk, args.map(wordText).join(' '), add)
+  } else if (program === '[[') {
+    if (changes.exact) for (const [index, word] of args.entries()) {
+      if (ARITHMETIC_TESTS.has(wordText(word))) arithmeticChanges(walk, [args[index - 1], args[index + 1]].map(operand => sourceText(operand ?? [])).join(' '), add)
+      if (wordText(word) === '=~') for (const shell of shells) for (const name of MATCHES[shell]) add(name)
+    }
+  } else if (program === 'getopts') {
+    if (/^-./.test(wordText(args[0] ?? [])) && wordText(args[0] ?? []) !== '--') return
+    if (changes.exact) for (const name of ['OPTARG', 'OPTIND']) add(name)
+    const operands = wordText(args[0] ?? []) === '--' ? args.slice(1) : args
+    const named = operands[0]?.every(part => part.kind === 'text') !== false
+    for (const word of operands.slice(1, named ? 2 : undefined)) nameIn(word, changes, add)
+  } else if (program === 'emulate' && shells.includes('zsh')) {
+    const mode = args.findIndex(word => !/^[-+]/.test(wordText(word)))
+    const flag = args.findIndex(word => wordText(word) === '-c')
+    const code = flag < 0 || args.slice(0, mode < 0 ? args.length : mode).some(word => !/^-R+$/.test(wordText(word))) ? undefined : args[flag + 1]
+    if (code !== undefined && literal(code)) scanText(walk, wordText(code), changes, depth)
+    else if (code !== undefined) changes.all = true
+  } else if (program === 'zstyle' && shells.includes('zsh')) {
+    const flag = wordText(args[0] ?? [])
+    if (flag === '-e') changes.all = true
+    else if (flag === '-g') nameIn(args[1], changes, add)
+    else if (['-s', '-b', '-a'].includes(flag)) nameIn(args[3], changes, add)
+  } else if (shells.some(shell => DECLARERS[shell].has(program))) declarationChanges(walk, program, args, changes, add)
+  else for (const name of assignedBy(walk, program, args, changes)) add(name)
+}
+
+/** Rule A4 for one builtin of the declare family in each shell that the code can run in, as DECLARERS says: adds each name that it assigns, with a value or by a conversion, and records in `locals` each name that every such shell declares as the function's own. Outside rule A4, a declaration counts as global and every name counts. A name reference, a pattern, an option word that is not literal text, and a name that is not literal text can assign any variable. */
+function declarationChanges(walk: Walk, program: string, args: readonly Word[], changes: Changes, add: (name: string) => void): void {
+  const assigned = new Set<string>()
+  let locals: Set<string> | undefined
+  for (const shell of shellsOf(changes)) {
+    const own = new Set<string>()
+    const entry = DECLARERS[shell].get(program)
+    if (entry !== undefined) declared(walk, entry, args, changes, assigned, own)
+    if (!walk.tick(1 + own.size + (locals?.size ?? 0))) return
+    locals = locals === undefined ? own : new Set([...locals].filter(name => own.has(name)))
+  }
+  for (const name of assigned) add(name)
+  for (const name of locals ?? []) if (!assigned.has(name)) changes.locals.add(name)
+}
+
+/** What one shell's builtin of the declare family does with its operands, as `declarationChanges` says: adds to `assigned` the names that it assigns, and to `own` those that it declares as the function's own. Its options end at `--`, at `-`, and at its first operand. */
+function declared(walk: Walk, entry: Declarer, args: readonly Word[], changes: Changes, assigned: Set<string>, own: Set<string>): void {
+  const letters: string[] = []
+  let digits = false
+  let index = 0
+  for (; index < args.length; index += 1) {
+    const text = wordText(args[index]!)
+    if (text === '--' || text === '-') {
+      index += 1
+      break
+    }
+    if (!/^[-+]/.test(text) || (text.startsWith('+') && entry.plusOperands === true)) break
+    if (!args[index]!.every(part => part.kind === 'text')) {
+      changes.all = true
+      return
+    }
+    for (const letter of text.slice(1)) {
+      if (entry.digits === true && /[0-9]/.test(letter)) digits = true
+      else letters.push(`${text[0]}${letter}`)
+    }
+  }
+  const operands = args.slice(index)
+  if (!walk.tick(1 + 4 * letters.length + operands.length)) return
+  const signed = new Set(letters)
+  const ties = signed.has('-T')
+  if (letters.some(letter => !entry.valid.has(letter) || entry.none.has(letter) || (entry.conflicts.has(letter.slice(1)) && signed.has(`${letter[0] === '-' ? '+' : '-'}${letter.slice(1)}`))) || (ties && operands.length < 2)) return
+  const lastSign = new Map(letters.map(letter => [letter.slice(1), letter[0]]))
+  const last = (letter: string): boolean => lastSign.get(letter.slice(1)) === letter[0]
+  const holds = (set: ReadonlySet<string>): boolean => [...set].some(letter => (entry.effective === true ? last(letter) : signed.has(letter)))
+  if ([...entry.any].some(last)) changes.all = true
+  const patterns = letters.some(letter => entry.patterns.has(letter))
+  const global = !changes.exact || entry.global === true || holds(entry.globals)
+  const width = digits || /^[0-9]+$/.test(wordText(operands[0] ?? []))
+  const converts = entry.converting === true ? !holds(entry.keeps) : holds(entry.converts) || (holds(entry.widths) && width)
+  for (const [position, word] of operands.entries()) {
+    const changed = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(wordText(word)) || converts || (ties && position === 1)
+    if (patterns) {
+      if (changed) changes.all = true
+      continue
+    }
+    nameIn(word, changes, name => {
+      if (!global) own.add(name)
+      else if (!changes.exact || changed) assigned.add(name)
+    })
+  }
+}
+
+/** The options of a builtin of NAMERS, read as one shell reads them: the signed letters, the values of its `named` letters, the functions that its `calls` letters name, and the operands after the options; undefined when an option word is not literal text. Its options end at `--`, at a lone `-`, and at its first operand. */
+function builtinOptions(entry: Assigner, args: readonly Word[]): { letters: string[]; named: (Word | undefined)[]; called: Word[]; operands: Word[]; fails?: true } | undefined {
+  const letters: string[] = []
+  const named: (Word | undefined)[] = []
+  const called: Word[] = []
+  let index = 0
+  for (; index < args.length; index += 1) {
+    const text = wordText(args[index]!)
+    if (text === '--') {
+      index += 1
+      break
+    }
+    if (text.length < 2 || !(text.startsWith('-') || (text.startsWith('+') && entry.plusOptions === true)) || (entry.words !== undefined && !entry.words.has(text))) break
+    if (!args[index]!.every(part => part.kind === 'text')) return undefined
+    let ends = entry.firstOnly === true
+    for (let at = 1; at < text.length; at += 1) {
+      const letter = `${text[0]}${text[at]}`
+      letters.push(letter)
+      if (letter === entry.endsWith) ends = true
+      if (!entry.takes.has(letter)) continue
+      let value: Word | undefined = [{ kind: 'text', text: text.slice(at + 1), quoted: false }]
+      if (at + 1 === text.length) {
+        index += 1
+        value = args[index]
+        if (value === undefined) return { letters, named: [], called: [], operands: [], fails: true }
+      }
+      if (entry.named.has(letter)) {
+        named.push(value)
+        if (entry.endsAtName === true) ends = true
+      }
+      if (entry.calls.has(letter) && value !== undefined) called.push(value)
+      break
+    }
+    if (ends) {
+      index += 1
+      break
+    }
+  }
+  return { letters, named, called, operands: args.slice(index) }
+}
+
+/** The variables that a builtin of NAMERS assigns in each shell that the code can run in. It marks `changes` when the builtin can assign any variable, and adds the functions that it runs to the calls. */
+function assignedBy(walk: Walk, program: string, args: readonly Word[], changes: Changes): Set<string> {
+  const names = new Set<string>()
+  for (const shell of shellsOf(changes)) {
+    const entry = NAMERS[shell].get(program)
+    if (entry === undefined) continue
+    const options = builtinOptions(entry, args)
+    if (!walk.tick(1 + 4 * (options?.letters.length ?? 0) + args.length)) break
+    if (options === undefined) {
+      changes.all = true
+      continue
+    }
+    const { letters, named, called, operands } = options
+    if (options.fails === true || letters.some(letter => (entry.valid !== undefined && !entry.valid.has(letter)) || entry.none.has(letter))) continue
+    if (letters.some(letter => entry.any.has(letter)) || (entry.listing !== undefined && !letters.some(letter => entry.listing!.has(letter)))) {
+      changes.all = true
+      continue
+    }
+    for (const word of called) {
+      if (word.every(part => part.kind === 'text')) changes.calls.add(wordText(word))
+      else changes.all = true
+    }
+    if ((entry.single === true && operands.length > 1) || (entry.oneWith !== undefined && letters.includes(entry.oneWith) && operands.length > 1)) continue
+    const words = entry.nameless !== undefined && letters.includes(entry.nameless) ? [] : entry.operands === 'all' ? operands : entry.operands === 'first' ? operands.slice(0, 1) : []
+    const own: string[] = []
+    for (const word of entry.last === true ? named.slice(-1) : named) nameIn(word, changes, name => own.push(name))
+    let fails = false
+    for (const [position, word] of words.entries()) {
+      if (!word.every(part => part.kind === 'text')) nameIn(word, changes, name => own.push(name))
+      else {
+        const text = entry.prompt === true && position === 0 ? wordText(word).replace(/\?[^]*$/, '') : wordText(word)
+        if (/^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?$/.test(text)) own.push(text.replace(/\[[^]*$/, ''))
+        else if (entry.prompt === true && /^[0-9]+$/.test(text)) continue
+        else if (entry.strict === 'stop') break
+        else if (entry.strict === 'fail') fails = true
+      }
+    }
+    if (fails) continue
+    for (const name of own) {
+      names.add(name)
+      if (entry.pids === true) names.add(`${name}_PID`)
+    }
+    for (const name of entry.fixed) names.add(name)
+    if (words.length === 0 && named.length === 0) for (const name of entry.fallback?.(letters) ?? []) names.add(name)
+  }
+  return names
+}
+
+/** Adds the variables that the expansions of a word assign in the shell that expands it: `${NAME=word}` and `${NAME:=word}`, and each assignment and step in an arithmetic expansion and in a `${…}` form that the lexer did not read, also inside the word of a parameter operator and in the elements of an array assignment. A substitution runs in a subshell and assigns none. */
+function expansionChanges(walk: Walk, word: Word, add: (name: string) => void): void {
+  if (!walk.tick(word.length)) return
+  for (const part of word) {
+    if (part.kind === 'param') {
+      if (part.op === '=' || part.op === ':=') add(part.name)
+      expansionChanges(walk, part.word, add)
+    } else if (part.kind === 'array') for (const element of part.elements) expansionChanges(walk, element, add)
+    else if (part.kind === 'unknown') arithmeticChanges(walk, unknownSource(part), add)
+  }
+}
+
+/** Whether a UTF-16 code unit is white space, as `\s` in a regular expression without the `u` flag says. */
+function isSpace(code: number): boolean {
+  return (code >= 9 && code <= 13) || code === 32 || code === 0xa0 || code === 0x1680 || (code >= 0x2000 && code <= 0x200a) || code === 0x2028 || code === 0x2029 || code === 0x202f || code === 0x205f || code === 0x3000 || code === 0xfeff
+}
+
+/** Whether a UTF-16 code unit can start a shell name: an ASCII letter or `_`. */
+function isNameStart(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95
+}
+
+/** Whether a UTF-16 code unit can stand in a shell name: an ASCII letter, a digit, or `_`. */
+function isNamePart(code: number): boolean {
+  return isNameStart(code) || (code >= 48 && code <= 57)
+}
+
+/** Adds each assignment and arithmetic step that `arithmeticNames` finds in a text of arithmetic or of a `${…}` form. */
+function arithmeticChanges(walk: Walk, text: string, add: (name: string) => void): void {
+  if (!walk.charge(text.length) || !walk.tick(4 * text.length)) return
+  for (const name of arithmeticNames(text)) add(name)
+}
+
+/** The text of `(( … ))`, which the parser reads as subshells, the outer one `arithmetic` since its `(` comes right before the next: the words and the redirection targets of the commands inside, at any depth, as typed; undefined for any other command, also for `( ( … ) )` with a space, which is two subshells. */
+function arithmeticOf(command: Simple): string | undefined {
+  if (!command.subshell || command.arithmetic !== true) return undefined
+  const words: Word[] = []
+  const pending = [...command.body ?? []]
+  while (pending.length > 0) {
+    for (const simple of pending.pop()!.commands) {
+      words.push(...simple.words, ...simple.redirects.map(redirect => redirect.target))
+      pending.push(...simple.body ?? [])
+    }
+  }
+  return words.map(sourceText).join(' ')
+}
+
+/** Adds the variable that an operand of a builtin names, such as `F`, `F[0]`, or `F=value`; an operand whose name is not literal text can name any variable. */
+function nameIn(word: Word | undefined, changes: Changes, add: (name: string) => void): void {
+  const [first] = word ?? []
+  const literal = word?.every(part => part.kind === 'text') === true
+  const name = first?.kind === 'text' ? (literal ? /^[A-Za-z_][A-Za-z0-9_]*/ : /^[A-Za-z_][A-Za-z0-9_]*(?=\[|\+?=)/).exec(first.text)?.[0] : undefined
+  if (name !== undefined) add(name)
+  else if (word !== undefined && !literal) changes.all = true
+}
+
+/** Adds what shell code given as text can assign, as `changesOf` says; code that does not parse, or nests past MAX_DEPTH, can assign any variable. */
+function scanText(walk: Walk, text: string, changes: Changes, depth: number): void {
+  if (depth >= MAX_DEPTH || !walk.charge(text.length) || !walk.tick(2 * (1 + text.length))) {
+    changes.all = true
+    return
+  }
+  const modern = readCommands(lex(text, true), true)
+  const commands = typeof modern === 'string' ? readCommands(lex(text), false) : modern
+  if (typeof commands === 'string') changes.all = true
+  else changesOf(walk, commands, changes, depth + 1)
+}
+
+/** The text of a word for the change scan: its text as typed, quotes removed, with the source text of each arithmetic expansion and each `${…}` form that the lexer did not read. */
+function sourceText(word: Word): string {
+  return word.map(part => (part.kind === 'unknown' ? unknownSource(part) : part.kind === 'param' ? `\${${part.name}${part.op}${sourceText(part.word)}}` : part.kind === 'array' ? `(${part.elements.map(sourceText).join(' ')})` : wordText([part]))).join('')
+}
+
+/** The builtins of bash and zsh, also those of the zsh modules that zsh loads by itself, and the reserved words that can stand where a command name stands but that the profile does not hold as structure: `!`, `[[`, `time`, `select`, `coproc`, `function`, and zsh `repeat`, `foreach`, `nocorrect`, `noglob`, and `-`. The builtins of a zsh module that only `zmodload` loads, such as `rm` of `zsh/files`, are left out, since `zmodload` is not allowed either. */
+const SHELL_COMMANDS = new Set([
+  '.', ':', '[', 'alias', 'bg', 'bind', 'break', 'builtin', 'caller', 'cd', 'command', 'compgen', 'complete', 'compopt', 'continue', 'declare', 'dirs', 'disown', 'echo', 'enable', 'eval', 'exec', 'exit', 'export', 'false', 'fc', 'fg', 'getopts', 'hash', 'help', 'history', 'jobs', 'kill', 'let', 'local', 'logout', 'mapfile', 'popd', 'printf', 'pushd', 'pwd', 'read', 'readarray', 'readonly', 'return', 'set', 'shift', 'shopt', 'source', 'suspend', 'test', 'times', 'trap', 'true', 'type', 'typeset', 'ulimit', 'umask', 'unalias', 'unset', 'wait',
+  '-', 'autoload', 'bindkey', 'bye', 'chdir', 'compadd', 'comparguments', 'compcall', 'compctl', 'compdescribe', 'compfiles', 'compgroups', 'compquote', 'comptags', 'comptry', 'compvalues', 'disable', 'echotc', 'echoti', 'emulate', 'float', 'functions', 'getln', 'integer', 'limit', 'nocorrect', 'noglob', 'print', 'private', 'pushln', 'r', 'rehash', 'sched', 'setopt', 'strftime', 'ttyctl', 'unfunction', 'unhash', 'unlimit', 'unsetopt', 'vared', 'whence', 'where', 'which', 'zcompile', 'zformat', 'zle', 'zmodload', 'zparseopts', 'zregexparse', 'zstat', 'zstyle',
+  '!', '[[', ']]', 'time', 'select', 'coproc', 'function', 'repeat', 'foreach', 'end',
+])
+
+/** The builtins that a call that needs the newer reading may run, as `outsideProfile` says. */
+const ALLOWED_BUILTINS = new Set(['echo', 'cd', 'true', 'false', ':'])
+
+/** The special parameters that an expansion in double quotes may name in the profile: `$1` to `$9`, `$#`, `$?`, `$$`, `$!`, and `$@`. */
+const PLAIN_SPECIALS = new Set(['1', '2', '3', '4', '5', '6', '7', '8', '9', '#', '?', '$', '!', '@'])
+
+/** The parameters that bash or zsh set or use by themselves: the shell variables of the bash manual, also those of the Bourne shell, and the parameters that zsh sets and uses, also those of its modules, of zle, and of its tables of aliases, functions, commands, and hooks. An assignment of one of them changes what the narrow reading does not follow: IFS how words split, PATH and CDPATH which program runs and where `cd` goes, HISTSIZE in zsh an arithmetic value, and PS4 code that `set -x` runs. */
+const SPECIAL = new Set([
+  'IFS', 'PS4', 'PROMPT4', '_', 'CDPATH', 'HOME', 'MAIL', 'MAILPATH', 'PATH', 'PS1', 'PS2',
+  'BASH', 'BASHOPTS', 'BASHPID', 'BASH_ALIASES', 'BASH_ARGC', 'BASH_ARGV', 'BASH_ARGV0', 'BASH_CMDS', 'BASH_COMMAND', 'BASH_COMPAT', 'BASH_ENV', 'BASH_EXECUTION_STRING', 'BASH_LINENO', 'BASH_LOADABLES_PATH', 'BASH_MONOSECONDS', 'BASH_REMATCH', 'BASH_SOURCE', 'BASH_SUBSHELL', 'BASH_TRAPSIG', 'BASH_VERSINFO', 'BASH_VERSION', 'BASH_XTRACEFD', 'CHILD_MAX', 'COLUMNS', 'COMP_CWORD', 'COMP_KEY', 'COMP_LINE', 'COMP_POINT', 'COMP_TYPE', 'COMP_WORDBREAKS', 'COMP_WORDS', 'COMPREPLY', 'COPROC', 'DIRSTACK', 'EMACS', 'ENV', 'EPOCHREALTIME', 'EPOCHSECONDS', 'EUID', 'EXECIGNORE', 'FCEDIT', 'FIGNORE', 'FUNCNAME', 'FUNCNEST', 'GLOBIGNORE', 'GLOBSORT', 'GROUPS', 'histchars', 'HISTCMD', 'HISTCONTROL', 'HISTFILE', 'HISTFILESIZE', 'HISTIGNORE', 'HISTSIZE', 'HISTTIMEFORMAT', 'HOSTFILE', 'HOSTNAME', 'HOSTTYPE', 'IGNOREEOF', 'INPUTRC', 'INSIDE_EMACS', 'LANG', 'LC_ALL', 'LC_COLLATE', 'LC_CTYPE', 'LC_MESSAGES', 'LC_NUMERIC', 'LC_TIME', 'LINENO', 'LINES', 'MACHTYPE', 'MAILCHECK', 'MAPFILE', 'OLDPWD', 'OPTARG', 'OPTERR', 'OPTIND', 'OSTYPE', 'PIPESTATUS', 'POSIXLY_CORRECT', 'PPID', 'PROMPT_COMMAND', 'PROMPT_DIRTRIM', 'PS0', 'PS3', 'PWD', 'RANDOM', 'READLINE_ARGUMENT', 'READLINE_LINE', 'READLINE_MARK', 'READLINE_POINT', 'REPLY', 'SECONDS', 'SHELL', 'SHELLOPTS', 'SHLVL', 'SRANDOM', 'TIMEFORMAT', 'TMOUT', 'TMPDIR', 'UID', 'auto_resume',
+  'ARGC', 'argv', 'status', 'pipestatus', 'CPUTYPE', 'EGID', 'ERRNO', 'GID', 'HOST', 'LOGNAME', 'signals', 'TRY_BLOCK_ERROR', 'TRY_BLOCK_INTERRUPT', 'TTY', 'TTYIDLE', 'USERNAME', 'VENDOR', 'ZSH_ARGZERO', 'ZSH_EVAL_CONTEXT', 'zsh_eval_context', 'ZSH_EXECUTION_STRING', 'ZSH_NAME', 'ZSH_PATCHLEVEL', 'zsh_scheduled_events', 'ZSH_SCRIPT', 'ZSH_SUBSHELL', 'ZSH_VERSION',
+  'ARGV0', 'BAUD', 'cdpath', 'CORRECT_IGNORE', 'CORRECT_IGNORE_FILE', 'DIRSTACKSIZE', 'fignore', 'fpath', 'FPATH', 'HISTCHARS', 'HISTORY_IGNORE', 'KEYBOARD_HACK', 'KEYTIMEOUT', 'LISTMAX', 'mailpath', 'manpath', 'MANPATH', 'module_path', 'MODULE_PATH', 'NULLCMD', 'path', 'POSTEDIT', 'PROMPT', 'PROMPT2', 'PROMPT3', 'prompt', 'PROMPT_EOL_MARK', 'psvar', 'PSVAR', 'READNULLCMD', 'REPORTMEMORY', 'REPORTTIME', 'RPROMPT', 'RPS1', 'RPROMPT2', 'RPS2', 'SAVEHIST', 'SPROMPT', 'STTY', 'TERM', 'TERMINFO', 'TERMINFO_DIRS', 'TIMEFMT', 'TMPPREFIX', 'TMPSUFFIX', 'WORDCHARS', 'ZBEEP', 'ZDOTDIR', 'ZLE_LINE_ABORTED', 'ZLE_REMOVE_SUFFIX_CHARS', 'ZLE_RPROMPT_INDENT', 'ZLE_SPACE_SUFFIX_CHARS', 'LOGCHECK', 'WATCH', 'watch', 'WATCHFMT', 'ZLS_COLORS', 'ZLS_COLOURS', 'LISTPROMPT', 'MENUPROMPT', 'MENUSELECT',
+  'MATCH', 'MBEGIN', 'MEND', 'match', 'mbegin', 'mend', 'reply', 'epochtime', 'errnos', 'sysparams', 'mapfile', 'langinfo', 'termcap', 'terminfo', 'BUFFER', 'CURSOR', 'LBUFFER', 'RBUFFER', 'WIDGET', 'KEYS', 'NUMERIC',
+  'parameters', 'commands', 'functions', 'dis_functions', 'functions_source', 'dis_functions_source', 'builtins', 'dis_builtins', 'reswords', 'dis_reswords', 'options', 'patchars', 'dis_patchars', 'aliases', 'dis_aliases', 'galiases', 'dis_galiases', 'saliases', 'dis_saliases', 'modules', 'dirstack', 'history', 'historywords', 'jobdirs', 'jobtexts', 'jobstates', 'nameddirs', 'userdirs', 'usergroups', 'funcfiletrace', 'funcsourcetrace', 'funcstack', 'functrace',
+  'chpwd_functions', 'precmd_functions', 'preexec_functions', 'periodic_functions', 'zshexit_functions', 'zshaddhistory_functions',
+])
+
+/** The first construct of a tree of commands outside the minimal profile, or undefined; `walkCall` makes a call that needs the modern reading opaque when the code that the walk parsed holds one. The profile: every simple command, at any depth, also in the code of each `$( )` and in an unquoted heredoc, has a command name that is literal text and that is no command of SHELL_COMMANDS but one of ALLOWED_BUILTINS; the structure is `case`, `if`, `for`, `while`, `until`, groups, pipelines, and lists, with no `!`; the tree defines no function and holds no `(( ))`; every expansion is one that `wordOutside` holds; each assignment, also as a `for` name, is `NAME=value`, `NAME=( … )`, or `NAME+=( … )` of a name that SPECIAL does not hold; and no redirection is `{name}`. Past MAX_DEPTH, nested code is outside the profile. */
+function outsideProfile(walk: Walk, commands: readonly Pipeline[], depth = 0): string | undefined {
+  for (const pipeline of commands) {
+    if (pipeline.negate) return '!'
+    for (const command of pipeline.commands) {
+      const work = commandWork(command)
+      if (!walk.charge(work) || !walk.tick(work)) return 'too much code'
+      const nested = [...command.body ?? [], ...command.loop?.condition ?? [], ...(command.branches ?? []).flatMap(branch => [...branch.condition ?? [], ...branch.body]), ...(command.cases?.clauses ?? []).flatMap(clause => clause.body)]
+      const found = commandOutside(walk, command, depth) ?? outsideProfile(walk, nested, depth)
+      if (found !== undefined) return found
+    }
+  }
+  return undefined
+}
+
+/** The construct of one command, apart from the commands in its body, outside the profile, as `outsideProfile` says, or undefined. The whole value of a scalar assignment, `NAME=` and one expansion, may be an unquoted expansion; every other word holds expansions only in double quotes. */
+function commandOutside(walk: Walk, command: Simple, depth: number): string | undefined {
+  if (command.definition !== undefined) return 'a function definition'
+  if (arithmeticOf(command) !== undefined) return '(( ))'
+  if (command.loop?.name !== undefined && SPECIAL.has(command.loop.name)) return command.loop.name
+  if (command.redirects.length > 0 && command.words.some(word => /^\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(wordText(word)))) return '{name} redirection'
+  const heredocs = command.redirects.flatMap(redirect => (redirect.heredoc === undefined || redirect.heredoc.quoted ? [] : [heredocWord(redirect.heredoc.text, true)?.word ?? []]))
+  const cases = command.cases === undefined ? [] : [command.cases.word, ...command.cases.clauses.flatMap(clause => clause.patterns)]
+  let at = 0
+  for (; at < command.words.length; at += 1) {
+    const word = command.words[at]!
+    const match = ASSIGNMENT.exec(wordText(word))
+    if (match === null) {
+      if (ELEMENT.test(wordText(word))) return 'an element assignment'
+      break
+    }
+    if (match[2] === '+' && !isArray(word)) return 'a scalar append'
+    if (SPECIAL.has(match[1]!)) return match[1]!
+    const [first, value] = word
+    const whole = word.length === 2 && first?.kind === 'text' && !first.quoted && first.text === `${match[1]}=` && value !== undefined && value.kind !== 'text'
+    const found = whole ? wordOutside(walk, [value], depth, true) : wordOutside(walk, word, depth)
+    if (found !== undefined) return found
+  }
+  for (const word of [...command.words.slice(at), ...command.loop?.words ?? [], ...cases, ...command.redirects.map(redirect => redirect.target), ...heredocs]) {
+    const found = wordOutside(walk, word, depth)
+    if (found !== undefined) return found
+  }
+  const program = command.words[at]
+  if (program === undefined) return undefined
+  if (!program.every(part => part.kind === 'text')) return 'a command name that is not literal'
+  const name = wordText(program)
+  if (KEYWORDS.has(name) || (SHELL_COMMANDS.has(name) && !ALLOWED_BUILTINS.has(name))) return name
+  return undefined
+}
+
+/** The expansion of one word outside the profile, or undefined. In double quotes it holds `"$name"`, `"${name}"`, the special parameters of PLAIN_SPECIALS, `"${name[@]}"` and `"${name[*]}"`, and `"$( )"` whose code the profile holds, read one level deeper; with `whole`, the word is the whole value of a scalar assignment and the expansion may stand unquoted. An unbraced `$name` must not come right before `[`, `:`, or `(`, as a zsh subscript, modifier, or glob qualifier does. Every other expansion is outside: one without double quotes, backticks, `${name:-word}`, `${#name}`, `${!name}`, a zsh flag, a subscript, an offset, `$*`, `$0`, arithmetic, also `$[ ]`, which the lexer leaves as text, and `<( )` or `>( )`. It reads the elements of an array assignment as words. */
+function wordOutside(walk: Walk, word: Word, depth: number, whole = false): string | undefined {
+  for (const [index, part] of word.entries()) {
+    let found: string | undefined
+    if (part.kind === 'text') {
+      if (part.text.includes('$[')) found = '$[ ]'
+    } else if (part.kind === 'array') for (const element of part.elements) found ??= wordOutside(walk, element, depth)
+    else if ((part.kind === 'var' || part.kind === 'sub' || part.kind === 'elements') && !part.quoted && !whole) found = `an unquoted ${spellingOf(part) || 'expansion'}`
+    else if (part.kind === 'var') {
+      const next = word[index + 1]
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(part.name) && !PLAIN_SPECIALS.has(part.name)) found = `$${part.name}`
+      else if (!spellingOf(part).startsWith('${') && next?.kind === 'text' && /^[[:(]/.test(next.text)) found = `$${part.name}${next.text.charAt(0)}`
+    } else if (part.kind === 'sub') {
+      if (spellingOf(part).startsWith('`')) found = 'backticks'
+      else if (depth >= MAX_DEPTH || !walk.charge(part.command.length) || !walk.tick(1 + part.command.length)) found = 'code nested too deep'
+      else {
+        const modern = readCommands(lex(part.command, true), true)
+        const commands = typeof modern === 'string' ? readCommands(lex(part.command), false) : modern
+        if (typeof commands !== 'string') found = outsideProfile(walk, commands, depth + 1)
+      }
+    } else if (part.kind === 'param') found = `\${${part.op === 'length' ? '#' : ''}${part.name}${part.op === 'length' ? '' : part.op}…}`
+    else if (part.kind === 'unknown') found = unknownSource(part) || 'an expansion that Arrester does not read'
+    else if (part.kind === 'process') found = `${part.isOutput ? '>' : '<'}( )`
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+/** Rule A4: after a call of each function or alias of `names` in this shell, each variable that a body of a called function can assign in this shell, as `changesOf` counts with `exact`, is unknown, as `setUnknown` says, so a deletion through it is opaque. The called functions are those of `names`, those that their bodies call, and those that the text of an alias of `names` calls; the alias text itself, and any other code, does not count, as on 1.1.3. A variable that a function body declares as its own, as `Changes` says, does not count for that body. An assignment of `HOME` or `PWD` makes only that one unknown. A body that can assign any variable makes every variable unknown, `HOME` and `PWD` too, except the variables that each such body declares as its own and that no other body can assign. A body that can assign any variable or runs `cd`, `pushd`, or `popd` leaves the folder and the previous folder unknown, and with `pushd` or `popd` the folder stack too. The positional parameters stay, since a call has its own. */
+function forgetAssigned(walk: Walk, state: State, names: readonly string[]): void {
+  const changes = noChanges(true)
+  const spared = new Set<string>()
+  const count = (own: Changes): void => {
+    if (!walk.tick(1 + own.names.size + own.calls.size + own.locals.size)) return
+    for (const [name, times] of own.names) if (!own.locals.has(name)) changes.names.set(name, (changes.names.get(name) ?? 0) + times)
+    for (const program of own.calls) changes.calls.add(program)
+    if (!own.all) return
+    if (!changes.all) for (const name of own.locals) spared.add(name)
+    else for (const name of spared) if (!own.locals.has(name)) spared.delete(name)
+    changes.all = true
+  }
+  const seen = new Set<string>()
+  const pending: string[] = []
+  const enqueue = (program: string): void => {
+    if (seen.has(program)) return
+    seen.add(program)
+    pending.push(program)
+  }
+  for (const name of names) enqueue(name)
+  while (pending.length > 0 && !(changes.all && spared.size === 0)) {
+    if (!walk.charge(1) || !walk.tick(3)) return
+    const next = pending.pop()!
+    const alias = state.named.get(next)
+    if (alias !== undefined) {
+      const calls = noChanges(true)
+      scanText(walk, alias, calls, 0)
+      for (const program of calls.calls) enqueue(program)
+    }
+    for (const body of walk.bodies.get(next) ?? []) {
+      const own = changesOf(walk, [{ commands: [{ ...body, definition: undefined }], negate: false, after: '' }], noChanges(true, state.shell === 'bash' || state.shell === 'zsh' ? state.shell : undefined))
+      count(own)
+      for (const program of own.calls) enqueue(program)
+    }
+  }
+  if (changes.all || [...changes.calls].some(program => DIRECTORY_CHANGERS.has(program) || program === 'chdir')) {
+    state.cwd = undefined
+    state.prev = undefined
+    if (changes.all || changes.calls.has('pushd') || changes.calls.has('popd')) state.stack = [...state.stack.map(() => undefined), undefined]
+  }
+  if (!walk.charge(changes.all ? state.vars.size + state.possible.size + state.removed.size + state.reaching.size + state.arrays.size : changes.names.size)) return
+  if (!walk.tick(1 + (changes.all ? state.vars.size + state.possible.size + state.removed.size + state.reaching.size + state.arrays.size : changes.names.size))) return
+  const forgotten = changes.all ? [...state.vars.keys(), ...state.possible.keys(), ...state.removed, ...state.reaching, ...state.arrays.keys()].filter(name => !spared.has(name) || changes.names.has(name)) : [...changes.names.keys()]
+  for (const name of forgotten) {
+    if (POSITIONAL.test(name)) continue
+    setUnknown(state, name)
+  }
+  if (changes.all) state.lost = true
+}
+
+/** Walks the text of the alias that a command's program word names, unquoted, with the command's other words and its redirections after it, one level deeper, in a copy of the shell and of its input, so the command still reads as it does without the alias; an alias does not expand again inside its own text. Returns the name of the alias when its text was walked, so rule A4 can reach the functions that it calls. */
+async function expandAlias(walk: Walk, command: Simple, leading: number, state: State, piped: Stdin): Promise<string | undefined> {
   const word = command.words[leading]
   const name = word?.length === 1 && word[0]?.kind === 'text' && !word[0].quoted ? word[0].text : undefined
   const text = name === undefined || walk.expanding.has(name) ? undefined : state.named.get(name)
-  if (name === undefined || text === undefined) return
+  if (name === undefined || text === undefined) return undefined
   if (walk.depth >= MAX_DEPTH) {
     walk.fail(OPAQUE.tooDeep)
-    return
+    return undefined
   }
-  if (!walk.charge(text.length)) return
-  const lexed = lex(text)
-  if ('error' in lexed) {
-    walk.fail(lexed.error)
-    return
-  }
+  if (!walk.charge(text.length)) return undefined
   const words = (list: readonly Word[]): Token[] => list.map(part => ({ type: 'word', word: part }))
-  const tokens: Token[] = [...words(command.words.slice(0, leading)), ...lexed.tokens, ...words(command.words.slice(leading + 1)), ...command.redirects.map(redirect => ({ type: 'redirect' as const, redirect }))]
+  const commands = parseCommands(walk, modern => {
+    const lexed = lex(text, modern)
+    return 'error' in lexed ? lexed : { ...lexed, tokens: [...words(command.words.slice(0, leading)), ...lexed.tokens, ...words(command.words.slice(leading + 1)), ...command.redirects.map(redirect => ({ type: 'redirect' as const, redirect }))] }
+  })
+  if (commands === undefined) return undefined
   walk.expanding.add(name)
   walk.depth += 1
-  await runTokens(walk, tokens, fork(walk, state), copied(piped))
+  await runList(walk, commands, fork(walk, state), copied(piped))
   walk.depth -= 1
   walk.expanding.delete(name)
+  return name
 }
 
-/** Runs resolved command words, expanding each xargs invocation separately within the nesting and work limits. */
-async function runCommand(walk: Walk, words: readonly Operand[], state: State, stdin: Stdin): Promise<{ program: string; output: Stdin; status?: boolean }> {
+/** Runs resolved command words, expanding each xargs invocation separately within the nesting and work limits; `called` names a function that the code defines, when the command calls one. A call of such a function whose body is not walked, as one that names `return` or `exit`, marks the walk `unread`. */
+async function runCommand(walk: Walk, words: readonly Operand[], state: State, stdin: Stdin): Promise<{ program: string; output: Stdin; status?: boolean; called?: string }> {
   const stripped = stripWrappers(walk, words, state)
   const at = stripped.chdir === undefined ? stripped.state : { ...stripped.state, cwd: stripped.chdir.dir, execdir: undefined }
   if (stripped.chdir?.symbolic || (stripped.chdir !== undefined && state.execdir !== undefined && stripped.args.some(arg => arg.values?.some(value => value.selected)))) walk.fail(OPAQUE.variableCode)
@@ -698,13 +1723,14 @@ async function runCommand(walk: Walk, words: readonly Operand[], state: State, s
   let status: boolean | undefined
   const body = word === undefined ? undefined : at.functions.get(word)
   if (body !== undefined) await callFunction(walk, body, args, at, stdin)
+  else if (word !== undefined && walk.bodies.has(word)) walk.unread = true
   if (head !== undefined && word !== undefined) {
     addSegment(run)
     const result = await dispatch(run, head)
     if (typeof result === 'boolean') status = result
   }
   if (stripped.replaces) state.terminated = true
-  return { program: run.program, output: produce(run), status }
+  return { program: run.program, output: produce(run), status, ...(word !== undefined && walk.bodies.has(word) ? { called: word } : {}) }
 }
 
 /** Walks the body of a function that a command calls, one level deeper, in a copy of the caller's shell with the call's arguments as its positional parameters and a copy of its input, so the call still reads as it does without the function. */
@@ -985,9 +2011,10 @@ function positionalChange(run: Run): boolean | undefined {
   return count <= positional.length
 }
 
-/** Skips inactive loops and scans other loop bodies once with bounded variable alternatives. */
+/** Skips inactive loops and scans other loop bodies once with bounded variable alternatives. A `while` or `until` loop whose one pass reads literal input and leaves more of it unread marks the walk `unread`, since a later pass reads other values. */
 async function runLoop(walk: Walk, command: Simple, state: State, input: Stdin): Promise<Stdin> {
   const loop = command.loop!
+  const start = input.kind === 'literal' ? input.positions ?? [0] : undefined
   if (loop.condition !== undefined) {
     await runList(walk, loop.condition, state, input)
     if (state.terminated) return NONE
@@ -1021,6 +2048,10 @@ async function runLoop(walk: Walk, command: Simple, state: State, input: Stdin):
   }
   const before = fork(walk, state)
   const output = await runList(walk, command.body ?? [], state, input)
+  if (loop.condition !== undefined && input.kind === 'literal' && start !== undefined) {
+    const after = input.positions ?? [0]
+    if (after.join() !== start.join() && after.some(position => position < input.text.length)) walk.unread = true
+  }
   if (loop.condition !== undefined && before.status === undefined) {
     mergeVariables(walk, state, before)
     if (state.cwd !== before.cwd) state.cwd = undefined
@@ -1304,6 +2335,7 @@ async function resolveFields(walk: Walk, word: Word, state: State, cache: Substi
     await substitution(walk, only.command, state, only.isOutput ? OTHER : NONE)
     return [{ raw, values: [], process: true }]
   }
+  if (word.length === 1 && only?.kind === 'elements') return elementFields(walk, only, state, cache, raw)
   const alternatives = bracesOf(word)
   if (alternatives === undefined) return [tooMany(walk, raw)]
   const operands: Operand[] = []
@@ -1324,6 +2356,32 @@ async function resolveFields(walk: Walk, word: Word, state: State, cache: Substi
     else operands.push({ raw, values: undefined, ...await possibleOf(walk, alternative, state, cache, true) })
   }
   return operands
+}
+
+/** The operands of a word that is one of `"${NAME[@]}"`, `${NAME[@]}`, `"${NAME[*]}"`, and `${NAME[*]}`, for an array whose elements Arrester knows: quoted `@` gives each element as it is; quoted `*` joins them with the first character of `IFS`, as quoted `$*` does; unquoted, each element splits and globs, as unquoted `$@` does. An element that does not resolve stays one operand that does not resolve. Any other expansion does not resolve, and is opaque as `unresolvedArray` says. */
+async function elementFields(walk: Walk, part: Extract<Part, { kind: 'elements' }>, state: State, cache: Substituted, raw: string): Promise<Operand[]> {
+  const elements = state.arrays.get(part.name)
+  if (elements === undefined) {
+    unresolvedArray(walk, part.name)
+    return [{ raw, values: undefined }]
+  }
+  if (!walk.count(elements.reduce((sum, element) => sum + (element.values?.length ?? 1), 0)) || !walk.charge(elements.length + 1) || !walk.tick(elements.length + 1)) return [{ raw, values: undefined }]
+  if (part.quoted && !part.joined) return elements.map(element => ({ ...element }))
+  const scope = fork(walk, state)
+  if (part.quoted) {
+    setPositional(walk, scope, elements)
+    return (await resolveFields(walk, [{ kind: 'var', name: '*', quoted: true }], scope, cache)).map(field => ({ ...field, raw }))
+  }
+  const fields: Operand[] = []
+  for (const element of elements) {
+    if (element.values === undefined) {
+      fields.push({ ...element })
+      continue
+    }
+    setPositional(walk, scope, [element])
+    for (const field of await resolveFields(walk, [{ kind: 'var', name: '@', quoted: false }], scope, cache)) fields.push({ ...field, raw })
+  }
+  return fields
 }
 
 /** Applies the shell's glob settings to the values of a word: `**` matches one folder outside zsh and `globstar`, `noglob` turns globs off, and the glob options join each glob. */
@@ -1442,7 +2500,7 @@ async function expandWithSeparator(walk: Walk, word: Word, state: State, cache: 
   return results
 }
 
-/** The choices of each part of a word; undefined when a part does not resolve. With `possible`, a variable without a value takes its possible values and a parameter operator on it the values of its word; with `splitText`, unquoted literal text splits. */
+/** The choices of each part of a word; undefined when a part does not resolve. With `possible`, a variable without a value takes its possible values and a parameter operator on it the values of its word; with `splitText`, unquoted literal text splits. A part that expands an array of the code is opaque here, since `elementFields` reads the only forms that resolve. */
 async function piecesOf(walk: Walk, word: Word, state: State, cache: Substituted, ifs: string, isFields: boolean, possible: boolean, splitText: boolean): Promise<Piece[][] | undefined> {
   const choices: Piece[][] = []
   let isResolved = true
@@ -1456,6 +2514,9 @@ async function piecesOf(walk: Walk, word: Word, state: State, cache: Substituted
       }
       if (texts.some(text => text === undefined)) isResolved = false
       else choices.push(texts.map(text => ({ text: text!, split: splitText && !part.quoted, live: !part.quoted, matches: false })))
+    } else if (walk.arrayNames.has(nameOf(part) ?? '') || arrayOf(part) !== undefined) {
+      unresolvedArray(walk, nameOf(part)!)
+      isResolved = false
     } else if (part.kind === 'var') {
       if (part.name === '@' || part.name === '*') {
         if (state.positional === undefined) {
@@ -1491,6 +2552,25 @@ async function piecesOf(walk: Walk, word: Word, state: State, cache: Substituted
     }
   }
   return isResolved ? choices : undefined
+}
+
+/** The name of the variable or the array that a part expands, if any; for an unknown part of the 1.1.3 reading, the array that its source text names, as in `${NAME[@]}`. */
+function nameOf(part: Part): string | undefined {
+  if (part.kind === 'unknown') return arrayOf(part)
+  return part.kind === 'var' || part.kind === 'param' || part.kind === 'elements' ? part.name : undefined
+}
+
+/** The array that a part expands with an array form, `${NAME[…]…}` with an optional `#` or `!`, in either reading; undefined for any other part. */
+function arrayOf(part: Part): string | undefined {
+  if (part.kind === 'elements') return part.name
+  return part.kind === 'unknown' ? part.name ?? /^\$\{[#!]?([A-Za-z_][A-Za-z0-9_]*)\[/.exec(unknownSource(part))?.[1] : undefined
+}
+
+/** An expansion of the array `name` that does not resolve. When the code assigns `name` as an array, the call is opaque, also in an older script, since the array comes from the call. Any other array form outside an older script is opaque in a call that needs the modern reading, as on 1.1.3, which did not parse it: at once when the walk already read such code, else through `Walk.unread`. In a call that 1.1.3 parses, the form keeps the 1.1.3 rule and does not resolve. */
+function unresolvedArray(walk: Walk, name: string): void {
+  if (walk.arrayNames.has(name)) walk.opaque ??= UNPARSED
+  else if (walk.oldScript === undefined && walk.modern) walk.fail(UNPARSED)
+  else if (walk.oldScript === undefined) walk.unread = true
 }
 
 /** The pieces of a variable's values; `split` when the expansion is unquoted outside zsh, so it splits and its glob characters are live. */
@@ -1565,7 +2645,7 @@ async function wordPieces(walk: Walk, word: Word, state: State, cache: Substitut
 /** Whether a variable or a positional parameter is set: a missing positional parameter and a removed variable are unset; undefined when Arrester does not know. */
 function isSet(walk: Walk, state: State, name: string): boolean | undefined {
   if (/^[0-9]+$/.test(name) && Number(name) > 0 && state.positional !== undefined) return Number(name) <= state.positional.length
-  if (state.vars.has(name)) return true
+  if (state.vars.has(name)) return state.vars.get(name) === UNKNOWN ? undefined : true
   if (state.removed.has(name) || (state.emptyEnv && name === 'HOME')) return false
   return variable(walk, state, name) === undefined ? undefined : true
 }
@@ -1659,15 +2739,16 @@ function tilde(text: string, home: string | undefined): string | undefined {
   return home === undefined ? undefined : `${match[1] ?? ''}${home}${text.slice(match[0].length)}`
 }
 
-/** The values of a positional parameter or variable, with inherited `HOME` and tracked `PWD`. */
+/** The values of a positional parameter or variable, with inherited `HOME` and tracked `PWD`, unless the shell `lost` them. */
 function variable(walk: Walk, state: State, name: string): Value[] | undefined {
   if (/^[0-9]+$/.test(name) && Number(name) > 0 && state.positional !== undefined) {
     const index = Number(name) - 1
     return index < state.positional.length ? state.positional[index]?.values : [{ text: '', glob: false }]
   }
   const values = state.vars.get(name)
-  if (values !== undefined) return values
+  if (values !== undefined) return values === UNKNOWN ? undefined : values
   if (state.removed.has(name) || (state.emptyEnv && name === 'HOME')) return [{ text: '', glob: false }]
+  if (state.lost) return undefined
   if (name === 'HOME' && walk.home !== undefined) return [{ text: walk.home, glob: false }]
   return name === 'PWD' && state.cwd !== undefined ? [{ text: state.cwd, glob: false }] : undefined
 }
@@ -1680,25 +2761,31 @@ async function substitution(walk: Walk, command: string, state: State, input: St
     return undefined
   }
   if (!walk.charge(command.length)) return undefined
-  const lexed = lex(command)
-  if ('error' in lexed) {
-    walk.fail(lexed.error)
-    return undefined
-  }
+  const commands = parseCommands(walk, modern => lex(command, modern))
+  if (commands === undefined) return undefined
   walk.depth += 1
   const inner = fork(walk, state)
-  const output = await runTokens(walk, lexed.tokens, inner, input)
+  if (inner.arrays.size > 0) {
+    const changes = changesOf(walk, commands)
+    if (changes.all) inner.arrays.clear()
+    else for (const name of changes.names.keys()) inner.arrays.delete(name)
+  }
+  const output = await runList(walk, commands, inner, input)
   walk.depth -= 1
   return output.kind === 'literal' && !output.uncertain ? output.text.replace(/\n+$/, '') : undefined
 }
 
-/** Assigns a scalar value, bounding the alternatives and text of append assignments before building them; a value that does not resolve keeps the possible values of its word. */
+/** Assigns a scalar value, bounding the alternatives and text of append assignments before building them; a value that does not resolve keeps the possible values of its word, and an append to a variable that `setUnknown` made unknown keeps it unknown. */
 function assign(walk: Walk, state: State, operand: Operand): boolean {
   const match = ASSIGNMENT.exec(operand.raw)
   if (match === null) return false
   const name = match[1]!
   const assigned = mapOperand(operand, text => text.slice(match[0].length))
   let values = assigned.values
+  if (match[2] === '+' && state.vars.get(name) === UNKNOWN) {
+    setUnknown(state, name)
+    return true
+  }
   if (match[2] === '+') {
     const previous = variable(walk, state, name)
     if (previous === undefined || values === undefined) {
@@ -1722,6 +2809,15 @@ function assign(walk: Walk, state: State, operand: Operand): boolean {
   if (operand.upstream === true) state.reaching.add(name)
   else state.reaching.delete(name)
   return true
+}
+
+/** Makes a variable unknown, also through a later join with a shell where it is known, until an assignment replaces it; it has no possible values and names no array that resolves. */
+function setUnknown(state: State, name: string): void {
+  state.vars.set(name, UNKNOWN)
+  state.possible.delete(name)
+  state.removed.delete(name)
+  state.reaching.delete(name)
+  state.arrays.delete(name)
 }
 
 /** Removes a variable and its export status, including built-in fallback values. */
@@ -1759,7 +2855,7 @@ type InputItem = Operand & { line?: number }
 /** The npm options that run `npm exec` in workspace folders, which Arrester does not know. */
 const NPM_WORKSPACES = ['-w', '--workspace', '--workspaces', '--ws', '--include-workspace-root', '--iwr']
 
-/** Removes wrappers (`sudo`, `env`, `timeout`, `xargs`, `runuser -u`, …), runners (`uv run`, `npx`, …), and keywords from the front of a command. A wrapper or runner that runs its command through a shell (`watch`, `npx -c`) gives `sh -c` with that command as code. `npm exec` with a workspace option stays as written. */
+/** Removes wrappers (`sudo`, `env`, `timeout`, `xargs`, `runuser -u`, …), runners (`uv run`, `npx`, …), and keywords from the front of a command. A wrapper or runner that runs its command through a shell (`watch`, `npx -c`) gives `sh -c` with that command as code. `npm exec` with a workspace option stays as written. A command, as the program or behind a wrapper, whose name is not literal text or is a command of SHELL_COMMANDS outside ALLOWED_BUILTINS marks the walk `unread`. */
 function stripWrappers(walk: Walk, words: readonly Operand[], state: State): Stripped {
   let rest = words
   let i = 0
@@ -1777,6 +2873,7 @@ function stripWrappers(walk: Walk, words: readonly Operand[], state: State): Str
       continue
     }
     const name = basenameOf(textOf(head))
+    if (/[$`]/.test(head.raw) || (SHELL_COMMANDS.has(name) && !ALLOWED_BUILTINS.has(name))) walk.unread = true
     if (name === 'command' && ['-v', '-V'].includes(textOf(rest[i + 1]))) return { state, replaces, args: [], chdir }
     const user = name === 'runuser' ? optionsOf(walk, rest, i + 1, RUNUSER.values, 0, undefined).given : undefined
     const wrapper = WRAPPERS.get(name) ?? (user?.has('-u') || user?.has('--user') ? RUNUSER : undefined)
@@ -2238,11 +3335,14 @@ function isRecursive(program: string, flags: readonly string[]): boolean {
   return ALWAYS_RECURSIVE.has(program) || (recursiveFlags !== undefined && hasFlag(flags, recursiveFlags.letters, recursiveFlags.longs))
 }
 
-/** Adds the effect of one operand; a `destroy` effect whose operand does not resolve makes the analysis opaque, and another effect takes the operand's possible values, if any, and is not remembered. Unlinking removes the final directory entry, so its last segment stays as written. A write is remembered as a file the command wrote unless `remember` is false. A `fullSearch` marks the effect `fullSearch`. */
+/** Adds the effect of one operand; a `destroy` effect whose operand does not resolve makes the analysis opaque, and another effect marks the walk `unread`, outside an older script, and takes the operand's possible values, if any, and is not remembered; so does a relative path in an unknown folder. Unlinking removes the final directory entry, so its last segment stays as written. A write is remembered as a file the command wrote unless `remember` is false. A `fullSearch` marks the effect `fullSearch`. */
 function addEffect(run: Run, operand: Operand, kind: EffectKind, recursive: boolean, definite = true, remember = true, fullSearch = false): void {
   if (operand.values === undefined) {
     if (kind === 'destroy') run.walk.fail(OPAQUE.unresolvedDeletion)
-    else if (operand.possible !== undefined) addEffect(run, { raw: operand.raw, values: operand.possible, upstream: operand.upstream }, kind, recursive, false, false, fullSearch)
+    else {
+      if (run.walk.oldScript === undefined) run.walk.unread = true
+      if (operand.possible !== undefined) addEffect(run, { raw: operand.raw, values: operand.possible, upstream: operand.upstream }, kind, recursive, false, false, fullSearch)
+    }
     return
   }
   for (const value of operand.values) {
@@ -2270,6 +3370,7 @@ function addEffect(run: Run, operand: Operand, kind: EffectKind, recursive: bool
     }
     if (path === undefined) {
       if (kind === 'destroy') run.walk.fail(OPAQUE.unresolvedDeletion)
+      else if (run.walk.oldScript === undefined) run.walk.unread = true
       continue
     }
     const reaches = recursive || operand.upstream === true
@@ -2360,19 +3461,25 @@ async function redirected(walk: Walk, redirect: Redirect, state: State, cache: S
   return { redirect, target: fields.length === 1 && only !== undefined ? only : { raw, values: undefined } }
 }
 
-/** The text a heredoc gives: a quoted delimiter keeps the body as it is; an unquoted one expands it, so its command substitutions run, and preserves unresolved fragments as uncertain input. */
+/** The text a heredoc gives: a quoted delimiter keeps the body as it is; an unquoted one expands it, so its command substitutions run, and preserves unresolved fragments as uncertain input. The body reads as other code does, as `parseCommands` says. */
 async function heredocText(walk: Walk, heredoc: { text: string; quoted: boolean }, state: State): Promise<{ text: string; uncertain?: true } | undefined> {
   if (heredoc.quoted) return { text: heredoc.text }
   if (!walk.charge(heredoc.text.length)) return undefined
-  const word = heredocWord(heredoc.text)
-  if (word === undefined) {
+  const keeps = walk.oldScript !== undefined || walk.legacy > 0
+  let read = heredocWord(heredoc.text, walk.modern && !keeps)
+  if (read?.legacy) walk.cut = true
+  if (read === undefined && !keeps && !walk.modern && walk.length <= NEW_LENGTH) {
+    read = heredocWord(heredoc.text, true)
+    if (read !== undefined) walk.modern = true
+  }
+  if (read === undefined) {
     walk.fail(UNPARSED)
     return undefined
   }
   const fragments: string[] = []
   let uncertain = false
   const cache: Substituted = new Map()
-  for (const part of word) {
+  for (const part of read.word) {
     const text = soleText(await resolveWhole(walk, [part], state, cache))
     if (text === undefined) uncertain = true
     else fragments.push(text)
@@ -2845,8 +3952,8 @@ type Language = 'shell' | 'code' | 'direct'
 /** Paths that name the reader's own stdin: a script there is the code on stdin. */
 const STDIN_PATHS = new Set(['/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'])
 
-/** A script's text, and whether the file last changed before the oldest open block opened. */
-type Script = { text: string; isOld: boolean }
+/** A script's text, whether the file last changed before the oldest open block opened, and whether the call wrote the text. */
+type Script = { text: string; isOld: boolean; written?: true }
 
 /** Reads a script that a command runs and walks or scans it. A script path with a glob in it cannot be read. A sourced script shares `scope`, the caller's state. */
 async function runScript(run: Run, operand: Operand, language: Language, args: readonly Operand[], scope?: State): Promise<void> {
@@ -2910,7 +4017,7 @@ async function scriptText(run: Run, path: string): Promise<Script | undefined> {
   if (run.state.written.has(path)) {
     const written = run.state.written.get(path)
     if (written === undefined) walk.opaque ??= OPAQUE.scriptUnreadable
-    return written === undefined ? undefined : { text: written, isOld: false }
+    return written === undefined ? undefined : { text: written, isOld: false, written: true }
   }
   if (walk.io.signal.aborted) {
     walk.fail(OPAQUE.interrupted)
@@ -2924,11 +4031,13 @@ async function scriptText(run: Run, path: string): Promise<Script | undefined> {
   return undefined
 }
 
-/** Walks a shell script one level deeper; in an older script, code that cannot be read is recorded and does not count. A newer script that an older one runs does not inherit that exemption. */
+/** Walks a shell script one level deeper; in an older script, code that cannot be read is recorded and does not count. A newer script that an older one runs does not inherit that exemption. An older script and a script that the call wrote keep the reading of Arrester 1.1.3, as `parseCommands` says. */
 async function walkScript(walk: Walk, script: Script, path: string, state: State): Promise<void> {
   const outer = walk.oldScript
   walk.oldScript = script.isOld ? outer ?? path : undefined
+  if (script.written) walk.legacy += 1
   await nested(walk, script.text, state)
+  if (script.written) walk.legacy -= 1
   walk.oldScript = outer
 }
 
