@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Claude_Code-2.1.296%2B-D97757" alt="Claude Code 2.1.296+">
   <img src="https://img.shields.io/badge/type-mod-555555" alt="mod">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555555" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/version-1.2.0-555555" alt="Version: 1.2.0">
+  <img src="https://img.shields.io/badge/version-1.2.1-555555" alt="Version: 1.2.1">
 </p>
 
 <p align="center"><strong>Arrester remembers your guards' blocks and stops common detours to the same target.</strong></p>
@@ -49,7 +49,7 @@ flowchart TD
 - **Match:** A later call matches when it reaches a blocked target, repeats the blocked command with changed flags or argument order, reads or changes a guard, or is opaque: it runs code or names paths that Arrester cannot read. A retry that only drops flags skips the retry rule; the other rules and your guards still apply.
 - **Guards:** The guard files are your user and project settings files, the hook scripts that your settings name by an absolute path or by a [supported relative path](#known-limits), Arrester's own folder, and your installed plugins (changes only). A nested `claude` command with `--settings`, `--bare`, `--safe-mode`, `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, or `--permission-mode bypassPermissions` also counts, and so do `claude plugin disable`, `claude plugin uninstall`, and `claude plugin configure … --values-stdin`, also as `claude plugins`. Any other nested `claude` run counts too, except a version, help, or tool command; see [Known limits](#known-limits).
 - **Your “No”:** Arrester stops only an exact retry of the call you rejected, so a changed request can go on. The target, guard, and opaque rules do not apply to it.
-- **Lifetime:** A block closes after `block_minutes` (see [Options](#options)), or when you run `/arrester clear`. `/clear`, `/resume`, and `/branch` start a fresh record.
+- **Lifetime:** A block closes after `block_minutes` (see [Options](#options)), or when you run `/arrester clear`. `/clear` starts a fresh record. `/branch` keeps the open blocks of the session that you branch from, with their ids and close times, and an in-app `/resume` of a session that ended in the same process, also by `/clear`, brings back its blocks that are still open. The transcript names the blocks kept, and `/arrester clear` closes them. A resume in a new process, such as `claude -r`, starts fresh; see [Known limits](#known-limits).
 - **No open block:** Arrester passes calls through without analyzing them.
 
 See the [usage guide](docs/usage.md#how-a-later-call-is-checked) for access rules, supported shell forms, and script handling.
@@ -135,7 +135,7 @@ Set them in `/config`. From a shell, write the values to a JSON file and run `cl
 
 ## How it compares
 
-Arrester remembers supported guard blocks within the current conversation. These tools provide complementary checks and controls.
+Arrester remembers supported guard blocks within the current conversation, and keeps them across `/branch` and an in-app `/resume` in the same Claude Code process. These tools provide complementary checks and controls.
 
 | Tool or feature | What it does | What Arrester adds |
 | --- | --- | --- |
@@ -160,7 +160,7 @@ Arrester remembers supported guard blocks within the current conversation. These
 - Paths that code builds at run time, in scripts, interpreter code, or command output, and code that Arrester does not read: functions and aliases from your shell profile, unlisted runners such as `bundle exec`, compiled programs, and remote commands. Arrester reads printing options only on the command line of a shell that runs a script file. So it records no read of a script printed after `set -x` or `bash -x -c`, or through options from the environment or a `#!` line, as in `set -x; . check.sh` or `SHELLOPTS=xtrace bash check.sh`.
 - Reads inside a folder after a blocked call that records no folder: a search with a file filter, a depth limit, or a file listing, such as `rg -t py KEY src` or `rg --files src`; a recursive copy, sync, archive, or compare, such as `cp -r src /tmp` or `rsync -a src /tmp`; a search of a broad folder, such as the project folder; or a search whose deny reason suggests another tool. A search with a file filter or a depth limit that names no folder, such as `rg -t py KEY`, counts as no read.
 - Copies into a folder from a glob, `find`, or `xargs`, such as `cp /staging/* /work/`, that replace a blocked file.
-- Hook denials in managed settings, a changed retry after your own “No”, which stops only the same call, and a path of a blocked call that the deny reason does not name, when the reason names another path of the call, such as `config/app.yaml` after a hook denied `cat config/secrets.env config/app.yaml` for `config/secrets.env`. The guard still checks that path.
+- Hook denials in managed settings, a changed retry after your own “No”, which stops only the same call, and a path of a blocked call that the deny reason does not name, when the reason names another path of the call, such as `config/app.yaml` after a hook denied `cat config/secrets.env config/app.yaml` for `config/secrets.env`. The guard still checks that path. Some session switches also start with no open block: a resume in a new process, such as `claude -r` or `claude --continue`, the copy that `/fork` starts, and, with managed settings or a Team or Enterprise sign-in, `/branch` and an in-app `/resume`. A reload of Arrester forgets the sessions that ended before it, and Arrester keeps the records of the last 32 sessions that ended.
 
 Arrester is not a sandbox and cannot recognize every shell rewrite. The [full list of known limits](docs/usage.md#known-limits) gives each limit with examples and workarounds.
 
@@ -189,7 +189,7 @@ Most of these limits apply while a block from a hook, deny rule, or auto mode cl
 Arrester never approves a tool call and never changes its input. It only denies a call or asks you about it. Every other call goes on, unchanged, to your other guards and the permission check.
 
 - **Network, models, and processes:** Arrester makes no network request, calls no model, and runs no process.
-- **Storage:** Its record lives in the session's memory. It writes no file.
+- **Storage:** Arrester keeps its records in the memory of the Claude Code process, never on disk. It writes no file. A record holds the commands, paths, and reasons of the blocks, and your decisions. When a session ends, also by `/clear`, Arrester keeps its whole record for a `/branch` or an in-app `/resume`. That record stays until 32 other sessions end after it, Arrester reloads, such as after a change in `/config`, or the process ends.
 - **What it reads:** While a block is open, or when a guard blocks a call, Arrester reads the kind, size, change time, and real path of each path that the call names, the text of a script that the call runs (up to 256 KiB), and the `HOME` variable, to expand `~`. When a guard blocks a call, it also reads your settings through Claude Code's settings API, to find the hook files that they name. It reads no file at other times.
 - **Interpreter code:** Arrester reads code that a call gives an interpreter, such as `python -c` or `node -e`, as text, to find the paths that it names. It never runs that code.
 - **What Claude sees:** When a guard blocks a call that runs a script, paths and commands from that script can appear in the block's record. `/arrester` and the deny reasons show that record to Claude.
