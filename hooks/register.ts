@@ -3,7 +3,7 @@
 // every decision about paths and words to the pure modules.
 
 import { atom, read, update } from 'claude-code'
-import type { Caught, EngineInterface, EventName, EventResult, FsStat, Hook, PluginOptions, Register, Timer, TraceOutcome } from 'claude-code'
+import type { Caught, EngineInterface, EventName, EventResult, FsStat, Hook, HookFailure, PluginOptions, Register, Timer, TraceOutcome } from 'claude-code'
 
 import { analyzeCall, envelopeCall, inputCall } from './analyze/call'
 import type { Call } from './analyze/call'
@@ -14,7 +14,7 @@ import { fixedGuards, hookPaths, SETTINGS_SOURCES } from './guards'
 import { cleared, EMPTY_JOURNAL, isRecorded, isTargetFolder, namedTargets, nextClose, openBlocks, pruned, renewed, targetsOf, withBlock, withDecision, withHeld, withoutHeld } from './journal'
 import { blocksOf, findings, renewable } from './match'
 import type { Finding } from './match'
-import { ALLOW_ONCE, ARGUMENT_HINT, blockOfText, causeOf, clearedText, clearRefused, COMMAND_DESCRIPTION, commandFailed, couldNotCheck, couldNotReadScript, couldNotReadSettings, couldNotRecord, couldNotRegister, couldNotResolve, couldNotSave, couldNotSync, decisionLine, evictionNotice, historyText, retryNotice, DENY, denyReason, failureOf, guardMessage, hasVerdict, HEADER, heldReason, holdEnded, holdUnanswered, homeUnset, hostText, incompleteCapture, hookFailedNoBlock, noVerdict, notCounted, phrase, question, statusLine, statusText, storedReason, summarize, uncheckedReason, USAGE, viewOf } from './text'
+import { ALLOW_ONCE, ARGUMENT_HINT, blockOfText, causeOf, clearedText, clearRefused, COMMAND_DESCRIPTION, commandFailed, couldNotCheck, couldNotKeep, couldNotReadScript, couldNotReadSettings, couldNotRecord, couldNotRegister, couldNotResolve, couldNotRestore, couldNotSave, couldNotSync, decisionLine, evictionNotice, historyText, keptLine, retryNotice, DENY, denyReason, failureOf, guardMessage, hasVerdict, HEADER, heldReason, holdEnded, holdUnanswered, homeUnset, hostText, incompleteCapture, hookFailedNoBlock, noVerdict, notCounted, phrase, question, statusLine, statusText, storedReason, summarize, uncheckedReason, USAGE, viewOf } from './text'
 import type { ArresterAction, ArresterGuard, ArresterJournal, ArresterSource } from '../types/index'
 
 /** The journal, the one `$.state` value. */
@@ -65,6 +65,15 @@ let syncs = 0
 /** Whether this module load reported that HOME is not set. */
 let isHomeReported = false
 
+/** The most ended sessions whose journal Arrester keeps; past it the oldest goes. */
+const MAX_ENDED = 32
+
+/** The journal of each session that ended in this process, by session id, oldest first: a branch or an in-app resume of that session takes it back. Module memory only, so a new process starts without it. */
+const endedJournals = new Map<string, ArresterJournal>()
+
+/** The session that ended last, until the next `classic.SessionStart` reads it: the parent of a branch. */
+let lastEnded: string | undefined
+
 /** Wires every hook. */
 export const register: Register = (on, options) => {
   const config = configOf(options)
@@ -75,11 +84,21 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('session.end', ($, e, next) => {
+  on('session.end', async ($, e, next) => {
     syncs += 1
     timer?.cancel()
     timer = undefined
     $.ui.status(undefined)
+    await keepJournal($, e.sessionId)
+    return next(e)
+  })
+
+  on('classic.SessionStart', async ($, e, next) => {
+    await switched($, config, e)
+    return next(e)
+  }).catch(($, e, next) => {
+    if (isReentry(next.error)) return next(e)
+    $.ui.log(hostText(couldNotRestore(failureOf(next.error))))
     return next(e)
   })
 
@@ -103,7 +122,7 @@ export const register: Register = (on, options) => {
       else if (verdict?.decision === 'deny' && verdict.rule === undefined && verdict.hook === 'PreToolUse' && e.tool_use_id !== undefined && !passedPreToolUses.has(e.tool_use_id)) await recordBlock($, config, 'tool.check', inputCall(e.tool, e.input, e.tool_use_id, e.agentId), 'hook', verdict.reason ?? 'denied', undefined, next.signal)
     }
   }).catch(($, e, next) => {
-    if (next.error.kind === 're-entry') return next(e)
+    if (isReentry(next.error)) return next(e)
     $.ui.log(hostText(couldNotRecord('tool.check', e.tool, failureOf(next.error))))
     return next(e)
   })
@@ -113,7 +132,7 @@ export const register: Register = (on, options) => {
     else $.ui.log(noVerdict(e.reason), { to: 'debug' })
     return next(e)
   }).catch(($, e, next) => {
-    if (next.error.kind === 're-entry') return next(e)
+    if (isReentry(next.error)) return next(e)
     $.ui.log(hostText(couldNotRecord('classic.PermissionDenied', e.tool_name, failureOf(next.error))))
     return next(e)
   })
@@ -146,6 +165,40 @@ async function sync(engine: EngineInterface, config: Config, event: string, drop
   } catch (error) {
     engine.ui.log(couldNotSync(event, causeOf(error)), { to: 'debug' })
   }
+}
+
+/** Keeps the journal of the session that ends, by its id, for a branch or an in-app resume of it, and remembers the session as the parent of a branch; past MAX_ENDED sessions the oldest goes. A journal that cannot be read is logged to the transcript, and a branch or resume of that session starts with no open block. */
+async function keepJournal(engine: EngineInterface, sessionId: string): Promise<void> {
+  lastEnded = sessionId
+  endedJournals.delete(sessionId)
+  try {
+    endedJournals.set(sessionId, await read(engine, JOURNAL))
+  } catch (error) {
+    engine.ui.log(hostText(couldNotKeep(causeOf(error))))
+    return
+  }
+  for (const id of endedJournals.keys()) {
+    if (endedJournals.size <= MAX_ENDED) break
+    endedJournals.delete(id)
+  }
+}
+
+/** After a switch in this process, read from `classic.SessionStart` by the new session's id, since `$.session.id()` still answers the old one: a branch (`fork`) takes the journal of the session that ended just before, and an in-app resume the journal that the resumed session left. Each keeps the blocks still open, with their ids and times, and drops the held calls, whose hooks ended with that session; one transcript line names the open blocks kept. `/clear` and every other start keep the fresh journal. A journal that cannot be restored is logged to the transcript. The status line is redrawn after every switch. */
+async function switched(engine: EngineInterface, config: Config, input: HookArgs<'classic.SessionStart'>[1]): Promise<void> {
+  const parent = lastEnded
+  lastEnded = undefined
+  const from = input.source === 'fork' ? parent : input.source === 'resume' ? input.session_id : undefined
+  const saved = from === undefined ? undefined : endedJournals.get(from)
+  if (saved !== undefined) {
+    try {
+      const journal = pruned(saved, await engine.clock.now(), config.minutes, true)
+      await update(engine, JOURNAL, () => journal)
+      if (journal.blocks.length > 0) engine.ui.log(keptLine(journal.blocks.map(block => block.id)))
+    } catch (error) {
+      engine.ui.log(hostText(couldNotRestore(causeOf(error))))
+    }
+  }
+  await sync(engine, config, 'classic.SessionStart')
 }
 
 /** Opens a block for a call that a guard blocked, with its targets and the guard list placed on the file system; a recursive read whose root is a regular file counts as a read of that file, and a `fullSearch` whose root is a folder as a read of the folder, unless `isTargetFolder` spares it or the reason names another tool to use. Another recursive read of a folder, such as a filtered search, `cp -r`, `rsync`, `tar`, or `diff -r`, records no folder. When the call has two or more targets and the reason of a guard other than the user names some but not all of them, as `namedTargets` reads its `guardMessage`, the block keeps only the named ones. Every script on disk counts as older than the block, and an older interpreter script is not scanned. A call opens one block, also when that block was cleared since. */
@@ -347,7 +400,7 @@ async function checkCall(engine: EngineInterface, config: Config, input: HookArg
 
 /** The `.catch` handler of the `tool.call` hook: replays a call that had settled and reports the block it could not record; refuses the call while blocks are open; passes it on while none is. */
 async function checkFailed(engine: EngineInterface, config: Config, input: HookArgs<'tool.call'>[1], forward: HookArgs<'tool.call'>[2] & Caught): Promise<EventResult<'tool.call'>> {
-  if (forward.error.kind === 're-entry') return hasOpenBlocks === false ? forward(input) : { deny: uncheckedReason('re-entry prevents checking this call') }
+  if (isReentry(forward.error)) return hasOpenBlocks === false ? forward(input) : { deny: uncheckedReason('re-entry prevents checking this call') }
   const failure = failureOf(forward.error)
   const tool = String(input.tool)
   if (forward.called) {
@@ -361,6 +414,12 @@ async function checkFailed(engine: EngineInterface, config: Config, input: HookA
   }
   engine.ui.log(hostText(couldNotCheck(tool, failure, open.count, open.cause)))
   return { deny: uncheckedReason(failure) }
+}
+
+/** Whether a hook failed on re-entry, which engines before 2.1.301 still pass to a `.catch`; that `.catch` then makes no engine call. */
+function isReentry(failure: HookFailure): boolean {
+  const kind: string = failure.kind
+  return kind === 're-entry'
 }
 
 /** The answer to a dispatch that was abandoned, which goes no further: nobody reads it, since the dispatch went on without this hook. */

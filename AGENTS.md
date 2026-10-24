@@ -41,7 +41,7 @@ claude plugin list --json | jq -r '.[] | select(.id == "arrester@arrester") | "\
 | `.claude-plugin/plugin.json` | The manifest, the two options, and the state contract path |
 | `.claude-plugin/marketplace.json` | The one-plugin marketplace |
 | `hooks/hooks.json` | The name of the hooks module, `./register.ts` |
-| `hooks/register.ts` | Every hook and every `$` call: block capture, the check of each call, the hold, the status line, `/arrester`, and the diagnostics |
+| `hooks/register.ts` | Every hook and every `$` call: block capture, the check of each call, the hold, the status line, `/arrester`, the session switches that keep the open blocks across `/branch` and an in-app `/resume`, and the diagnostics |
 | `hooks/analyze/paths.ts` | Lexical paths, globs, braces, and how an effect's path stands to a protected path |
 | `hooks/analyze/lexer.ts` | The shell lexer |
 | `hooks/analyze/programs.ts` | The program tables of the shell analysis |

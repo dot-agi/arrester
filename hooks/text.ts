@@ -190,6 +190,11 @@ export function decisionLine(decision: ArresterDecision, call: ArresterCall): st
   return `refused ${who(call)} (held for ${ids}; no answer: ${line(decision.detail, 1500)})`
 }
 
+/** The transcript line when a session keeps open blocks from the session before a `/branch` or an in-app `/resume`; Claude does not read it. */
+export function keptLine(ids: readonly string[]): string {
+  return ids.length === 1 ? `this session keeps open block ${ids.join('')} from before the switch. /arrester clear closes it.` : `this session keeps open blocks ${ids.join(', ')} from before the switch. /arrester clear closes them.`
+}
+
 /** The status line: open blocks and held calls, or nothing when there are none. */
 export function statusLine(open: number, held: number, evicted?: string): string | undefined {
   if (open === 0 && held === 0 && evicted === undefined) return undefined
@@ -275,6 +280,16 @@ export function commandFailed(failure: string): string {
 /** Diagnostic: `/arrester` could not be registered. */
 export function couldNotRegister(message: string): string {
   return `arrester: session.start: could not register /arrester (${message})`
+}
+
+/** Diagnostic: the journal of the session that ends could not be kept for a branch or an in-app resume of it. */
+export function couldNotKeep(message: string): string {
+  return `arrester: session.end: could not keep the open blocks (${message}); a branch or resume of this session starts with none`
+}
+
+/** Diagnostic: a branch or an in-app resume could not restore the journal of the session before the switch. */
+export function couldNotRestore(message: string): string {
+  return `arrester: classic.SessionStart: could not restore the open blocks (${message}); this session starts with none`
 }
 
 /** Diagnostic: the status line could not be refreshed. */
